@@ -1,7 +1,6 @@
 :root {
   --bg: #0b1220;
   --bg-elev: #121a2b;
-  --bg-soft: #182237;
   --line: #2a3650;
   --text: #e8eefc;
   --muted: #9aa8c3;
@@ -1229,8 +1228,7 @@ a {
   color: var(--muted);
 }
 
-.badge.go,
-.badge.ok {
+.badge.go {
   color: #b8ffe0;
   border-color: rgba(62, 207, 142, 0.35);
   background: rgba(62, 207, 142, 0.1);
@@ -1372,14 +1370,6 @@ a {
 
 .metrics-session.collapsed .metrics-session-body {
   display: none;
-}
-
-.metrics-session-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 14px;
 }
 
 .metrics-grid {

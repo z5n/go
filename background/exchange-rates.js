@@ -111,33 +111,3 @@ export async function convertToUsd(amount, fromCurrency) {
     converted: true,
   };
 }
-
-export async function localizeMoneyFields(fields, fromCurrency) {
-  const currency = fromCurrency || fields?.currency || null;
-  const converted = await convertToUsd(fields?.amount, currency);
-  if (converted.amount == null) {
-    return {
-      ...fields,
-      currency: "USD",
-      amount: null,
-      amountFmt: null,
-      amountOriginal: fields?.amount ?? null,
-      currencyOriginal: currency || null,
-      fxRateToUsd: null,
-    };
-  }
-  const usd = converted.amount;
-  return {
-    ...fields,
-    amount: Math.round(usd),
-    amountFmt: `$${Math.round(usd)}`,
-    currency: "USD",
-    amountOriginal: fields?.amount ?? null,
-    currencyOriginal: converted.fromCurrency,
-    fxRateToUsd: converted.rate,
-    amountAfterTax:
-      fields?.amountAfterTax == null
-        ? fields?.amountAfterTax
-        : Math.round((await convertToUsd(fields.amountAfterTax, currency)).amount ?? fields.amountAfterTax),
-  };
-}

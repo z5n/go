@@ -515,7 +515,7 @@ function roomGroupDescriptionParts(stayKey, group) {
   const row = open
     ? `<tr class="room-desc-row">
         <td colspan="5">
-          <div class="room-desc-body open">
+          <div class="room-desc-body">
             ${paragraphs.map((p) => `<p class="room-desc-p">${escapeHtml(p)}</p>`).join("")}
           </div>
         </td>
@@ -1230,7 +1230,7 @@ function refreshTable() {
         <td><div class="rate-plan-cell">${badge}<div class="hotel-code">${escapeHtml(row.ratePlanName || "")}</div></div></td>
         <td><a class="book-link" href="${escapeHtml(row.bookUrl)}" target="_blank" rel="noopener">Book</a></td>
       </tr>
-      <tr class="detail-row${open ? " open" : ""}" data-detail-for="${escapeHtml(key)}"${open ? "" : " hidden"}>
+      <tr class="detail-row${open ? " open" : ""}"${open ? "" : " hidden"}>
         <td colspan="8">
           <div class="detail-panel">
             <dl class="detail-grid">${details}</dl>
@@ -1493,7 +1493,7 @@ function renderRecentSearches(query = "") {
     const idx = flat.length;
     flat.push({ kind: "recent", entry });
     html += `<div class="recent-row">
-      <button type="button" class="suggest-item recent-item" role="option" data-index="${idx}" id="suggest-${idx}">
+      <button type="button" class="suggest-item recent-item" role="option" data-index="${idx}">
         <span class="suggest-primary">${escapeHtml(entry.destination)}</span>
         <span class="suggest-secondary">${escapeHtml(formatRecentMeta(entry))}</span>
       </button>
@@ -1562,7 +1562,7 @@ function renderSuggestions(suggestions) {
     for (const item of items) {
       const idx = flat.length;
       flat.push({ kind: "suggestion", ...item });
-      html += `<button type="button" class="suggest-item" role="option" data-index="${idx}" id="suggest-${idx}">
+      html += `<button type="button" class="suggest-item" role="option" data-index="${idx}">
         <span class="suggest-primary">${escapeHtml(item.primary)}</span>
         <span class="suggest-secondary">${escapeHtml(item.secondary || "")}</span>
       </button>`;

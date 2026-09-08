@@ -16,7 +16,6 @@ import {
   setCachedShopRooms,
   deleteCachedShopRooms,
   pruneStaleCache,
-  getCacheStats,
 } from "./rate-cache.js";
 import {
   startMetricsSession,
@@ -261,17 +260,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
-      if (message?.type === "OPEN_APP") {
-      let windowId = message.windowId;
-      if (windowId == null && sender?.tab?.windowId != null) {
-        windowId = sender.tab.windowId;
-      }
-      await openSearchPage(windowId ?? null);
-      sendResponse({ ok: true });
-      return;
-    }
-
-    if (message?.type === "AUTOCOMPLETE_DESTINATION") {
+      if (message?.type === "AUTOCOMPLETE_DESTINATION") {
       const result = await autocompleteDestination(message.query || "", {
         limit: message.limit || 8,
       });
@@ -292,19 +281,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message?.type === "GET_CACHE_STATS") {
-      const stats = await getCacheStats();
-      sendResponse({ ok: true, ...stats });
-      return;
-    }
-
     if (message?.type === "FETCH_ROOM_RATES") {
       const {
         ctyhocn,
         arrivalDate,
         departureDate,
         friendsAndFamily = true,
-        forceRefresh = false,
       } = message;
       if (!ctyhocn || !arrivalDate || !departureDate) {
         sendResponse({ ok: false, error: "Missing stay details for room shop." });
@@ -319,8 +301,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         guestId,
         currency: "USD",
       };
-      if (forceRefresh) await deleteCachedShopRooms(cacheParams);
-      let payload = forceRefresh ? null : await getCachedShopRooms(cacheParams);
+      let payload = await getCachedShopRooms(cacheParams);
       let fromCache = Boolean(payload);
       if (!payload) {
         try {

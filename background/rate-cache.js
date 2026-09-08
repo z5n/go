@@ -210,30 +210,7 @@ async function deleteCachedShopRooms(params) {
   }
 }
 
-async function getCacheStats() {
-  const db = await openDb();
-  try {
-    const all = await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readonly");
-      const req = tx.objectStore(STORE).getAll();
-      req.onsuccess = () => resolve(req.result || []);
-      req.onerror = () => reject(req.error);
-    });
-    const now = Date.now();
-    let fresh = 0;
-    let stale = 0;
-    for (const entry of all) {
-      if (now - Number(entry.fetchedAt || 0) > TTL_MS) stale += 1;
-      else fresh += 1;
-    }
-    return { total: all.length, fresh, stale, ttlHours: TTL_MS / 3600000 };
-  } finally {
-    db.close();
-  }
-}
-
 export {
-  TTL_MS,
   getCachedCalendar,
   setCachedCalendar,
   deleteCachedCalendar,
@@ -241,6 +218,4 @@ export {
   setCachedShopRooms,
   deleteCachedShopRooms,
   pruneStaleCache,
-  getCacheStats,
-  calendarCacheKey,
 };

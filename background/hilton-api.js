@@ -1463,11 +1463,9 @@ export {
   searchHotelsNearDestination,
   fetchCalendar,
   fetchShopRooms,
-  geocodeDestination,
   autocompleteDestination,
   syncGuestIdFromCookies,
   getAuthSession,
   getAccessTokenFingerprint,
-  UnauthorizedError,
   isUnauthorizedError,
 };
