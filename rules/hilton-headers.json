@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "Origin",
+          "operation": "set",
+          "value": "https://www.hilton.com"
+        },
+        {
+          "header": "Referer",
+          "operation": "set",
+          "value": "https://www.hilton.com/en/go-hilton/"
+        }
+      ]
+    },
+    "condition": {
+      "requestDomains": ["www.hilton.com", "hilton.com"],
+      "resourceTypes": ["xmlhttprequest", "other"],
+      "regexFilter": "^https://[^/]+/(graphql|dx-customer)/"
+    }
+  }
+]

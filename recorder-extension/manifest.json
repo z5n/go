@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Go Hilton Traffic Recorder",
+  "version": "0.2.1",
+  "description": "Records Go Hilton GraphQL + clicks to a local observer for extension optimization.",
+  "permissions": ["storage"],
+  "host_permissions": ["https://www.hilton.com/*", "http://127.0.0.1:3847/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Go Hilton Recorder",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.hilton.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["page-hook.js"],
+      "matches": ["https://www.hilton.com/*"]
+    }
+  ]
+}

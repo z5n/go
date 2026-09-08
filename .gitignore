@@ -1,0 +1,12 @@
+node_modules/
+observe-out/
+_metadata/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*.log
+.env
+.env.*

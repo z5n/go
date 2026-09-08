@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "go+",
+  "version": "0.8.6",
+  "description": "Go Hilton availability search engine.",
+  "incognito": "split",
+  "permissions": [
+    "storage",
+    "webRequest",
+    "tabs",
+    "cookies",
+    "scripting",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": [
+    "https://www.hilton.com/*",
+    "https://*.hilton.com/*",
+    "https://nominatim.openstreetmap.org/*",
+    "https://cdn.jsdelivr.net/*",
+    "https://*.currency-api.pages.dev/*"
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "hilton_headers",
+        "enabled": true,
+        "path": "rules/hilton-headers.json"
+      }
+    ]
+  },
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Open go+ search",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

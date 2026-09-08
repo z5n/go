@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>go+ — Metrics</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topnav">
+        <a class="brand" href="index.html">
+          <span class="brand-mark">go</span><span class="brand-plus">+</span>
+        </a>
+        <nav class="nav-links">
+          <a href="index.html">Search</a>
+          <a class="active" href="metrics.html">Metrics</a>
+          <a href="https://www.hilton.com/en/go-hilton/" target="_blank" rel="noopener">Go Portal</a>
+        </nav>
+      </header>
+
+      <main>
+        <section class="hero">
+          <h1>Session metrics</h1>
+          <p class="lede">
+            Outbound requests made while a go+ search page is open. Each open search tab is one session.
+          </p>
+        </section>
+
+        <section class="metrics-summary" id="metricsSummary">
+          <div class="metric-card">
+            <div class="metric-label">Active sessions</div>
+            <div class="metric-value" id="metricActive">0</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Total requests</div>
+            <div class="metric-value" id="metricTotal">0</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Tracked sessions</div>
+            <div class="metric-value" id="metricSessions">0</div>
+          </div>
+        </section>
+
+        <section class="results-wrap metrics-panel">
+          <div class="results-meta">
+            <div id="metricsLabel">Waiting for search activity…</div>
+            <button type="button" class="ghost-btn" id="refreshMetricsBtn">Refresh</button>
+          </div>
+          <div id="metricsBody" class="metrics-body"></div>
+        </section>
+      </main>
+
+      <footer class="site-footer">
+        Developed by
+        <a href="https://github.com/z5n" target="_blank" rel="noopener">z5n</a>
+      </footer>
+    </div>
+    <script type="module" src="metrics.js"></script>
+  </body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "name": "go",
+  "version": "1.0.0",
+  "description": "Chrome extension that sits on top of the **Go Hilton** team-member travel portal and finds the **cheapest available rates for the next ~2 months** across hotels in your search — without opening each hotel’s flexible-dates calendar by hand.",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}

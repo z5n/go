@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>go+ — Search engine for team members</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topnav">
+        <a class="brand" href="index.html">
+          <span class="brand-mark">go</span><span class="brand-plus">+</span>
+        </a>
+        <nav class="nav-links">
+          <a class="active" href="index.html">Search</a>
+          <a href="metrics.html">Metrics</a>
+          <a href="https://www.hilton.com/en/go-hilton/" target="_blank" rel="noopener">Go Portal</a>
+        </nav>
+        <div class="session" id="sessionStatus">Checking session…</div>
+      </header>
+
+      <main>
+        <section class="hero">
+          <h1>Find team member availability</h1>
+          <p class="lede">
+            Pick an arrival window and stay length.
+          </p>
+        </section>
+
+        <form class="search-card" id="searchForm">
+          <div class="search-primary">
+            <div class="fields">
+              <label class="field destination-field">
+                <span class="field-label">Destination</span>
+                <input
+                  id="destination"
+                  name="destination"
+                  placeholder="City, hotel, or airport"
+                  required
+                  autocomplete="off"
+                  role="combobox"
+                  aria-autocomplete="list"
+                  aria-expanded="false"
+                  aria-controls="destinationSuggest"
+                />
+                <div id="destinationSuggest" class="suggest-panel" hidden role="listbox"></div>
+              </label>
+              <label class="field">
+                <span class="field-label">Search from</span>
+                <input id="fromDate" name="fromDate" type="date" required />
+              </label>
+              <label class="field">
+                <span class="field-label">Search to</span>
+                <input id="toDate" name="toDate" type="date" required />
+              </label>
+              <label class="field field-sm">
+                <span class="field-label">Nights</span>
+                <input id="nights" name="nights" type="number" min="1" max="7" value="1" title="Length of stay in nights (check-out = check-in + nights)" />
+              </label>
+              <button class="search-btn" type="submit" id="searchBtn">Search</button>
+            </div>
+          </div>
+
+          <div class="search-filters">
+            <div class="filters-label">Filters</div>
+            <div class="filters-row" id="filtersRow">
+              <label class="chip chip-sm">
+                <span class="chip-label">Max rate</span>
+                <input id="maxRate" type="number" min="0" step="1" placeholder="any" />
+              </label>
+              <label class="chip chip-sm">
+                <span class="chip-label">Min rooms</span>
+                <input id="minRooms" type="number" min="1" max="9" value="1" />
+              </label>
+              <label class="chip chip-sm">
+                <span class="chip-label">Hotels</span>
+                <input id="maxHotels" type="number" min="1" max="40" value="20" />
+              </label>
+              <label class="chip check">
+                <input id="goOnly" type="checkbox" />
+                <span class="chip-label">Go rates only</span>
+              </label>
+              <label class="chip chip-rate-type">
+                <span class="chip-label">Rate type</span>
+                <select id="rateType">
+                  <option value="fnf">Friends &amp; Family</option>
+                  <option value="tm">Team Member</option>
+                </select>
+              </label>
+              <div class="dow-filter" id="dowFilter">
+                <button type="button" class="dow-trigger" id="dowTrigger" aria-expanded="false" aria-controls="dowPanel">
+                  <span class="dow-trigger-label">Day of Week</span>
+                  <span class="dow-trigger-meta" id="dowTriggerMeta"></span>
+                  <span class="dow-chevron" aria-hidden="true">▾</span>
+                </button>
+                <div class="dow-panel" id="dowPanel" hidden>
+                  <div class="dow-panel-top">
+                    <span class="dow-hint">Show arrivals on</span>
+                    <button type="button" class="dow-reset" id="dowReset">Reset all</button>
+                  </div>
+                  <div class="dow-days" id="dowDays">
+                    <label><input type="checkbox" value="1" /> Monday</label>
+                    <label><input type="checkbox" value="2" /> Tuesday</label>
+                    <label><input type="checkbox" value="3" /> Wednesday</label>
+                    <label><input type="checkbox" value="4" /> Thursday</label>
+                    <label><input type="checkbox" value="5" /> Friday</label>
+                    <label><input type="checkbox" value="6" /> Saturday</label>
+                    <label><input type="checkbox" value="0" /> Sunday</label>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </form>
+
+        <section class="status-bar" id="statusBar">Enter a destination and date range to begin.</section>
+        <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+
+        <section class="results-wrap">
+          <div class="results-meta">
+            <div id="resultsLabel">No results yet</div>
+            <button type="button" class="ghost-btn" id="exportBtn" disabled>Export CSV</button>
+          </div>
+          <div class="table-scroll">
+            <table class="results" id="resultsTable">
+              <thead>
+                <tr>
+                  <th><button type="button" class="sort-btn" data-sort="arrivalDate">Check-in</button></th>
+                  <th><button type="button" class="sort-btn" data-sort="hotelName">Hotel</button></th>
+                  <th><button type="button" class="sort-btn" data-sort="brandCode">Brand</button></th>
+                  <th><button type="button" class="sort-btn" data-sort="city">City</button></th>
+                  <th><button type="button" class="sort-btn" data-sort="amount">Price</button></th>
+                  <th><button type="button" class="sort-btn" data-sort="roomsAvail">Rooms</button></th>
+                  <th><button type="button" class="sort-btn" data-sort="specialRateType">Rate</button></th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="resultsBody">
+                <tr class="empty">
+                  <td colspan="8">Results will appear here after a search.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+      <footer class="site-footer">
+        Developed by
+        <a href="https://github.com/z5n" target="_blank" rel="noopener">z5n</a>
+      </footer>
+    </div>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
