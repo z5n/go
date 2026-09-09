@@ -129,7 +129,28 @@
                   <th><button type="button" class="sort-btn" data-sort="arrivalDate">Check-in</button></th>
                   <th><button type="button" class="sort-btn" data-sort="hotelName">Hotel</button></th>
                   <th><button type="button" class="sort-btn" data-sort="brandCode">Brand</button></th>
-                  <th><button type="button" class="sort-btn" data-sort="city">City</button></th>
+                  <th class="city-filter-th">
+                    <div class="city-filter">
+                      <button
+                        type="button"
+                        class="city-filter-trigger"
+                        id="cityFilterTrigger"
+                        aria-expanded="false"
+                        aria-haspopup="true"
+                      >
+                        <span class="city-filter-label">City</span>
+                        <span class="city-filter-meta" id="cityFilterMeta"></span>
+                        <span class="city-filter-chevron" aria-hidden="true">▾</span>
+                      </button>
+                      <div class="city-filter-panel" id="cityFilterPanel" hidden>
+                        <div class="city-filter-panel-top">
+                          <span class="city-filter-hint">Filter by city</span>
+                          <button type="button" class="city-filter-reset" id="cityFilterReset">Reset</button>
+                        </div>
+                        <div class="city-filter-list" id="cityFilterList"></div>
+                      </div>
+                    </div>
+                  </th>
                   <th><button type="button" class="sort-btn" data-sort="amount">Price</button></th>
                   <th><button type="button" class="sort-btn" data-sort="roomsAvail">Rooms</button></th>
                   <th><button type="button" class="sort-btn" data-sort="specialRateType">Rate</button></th>

@@ -1035,7 +1035,7 @@ function sortHotelsByDistance(hotels, place) {
     .map((h) => {
       const dist =
         h.distance ??
-        (h.lat != null && h.lon != null
+        (h.lat != null && h.lon != null && place?.lat != null && place?.lon != null
           ? haversineKm(place.lat, place.lon, h.lat, h.lon)
           : Number.POSITIVE_INFINITY);
       return { ...h, distance: Number.isFinite(dist) ? dist : h.distance };
@@ -1043,19 +1043,248 @@ function sortHotelsByDistance(hotels, place) {
     .sort((a, b) => (a.distance ?? 1e9) - (b.distance ?? 1e9));
 }
 
-async function searchHotelsNearDestination(destination, { limit = 30 } = {}) {
-  const place = await geocodeDestination(destination);
+function normalizeCityToken(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+/** Common Hilton/locality aliases so Milan ≡ Milano, etc. */
+const CITY_ALIAS_GROUPS = [
+  ["milan", "milano"],
+  ["rome", "roma"],
+  ["florence", "firenze"],
+  ["venice", "venezia"],
+  ["naples", "napoli"],
+  ["munich", "munchen", "muenchen"],
+  ["cologne", "koln", "koeln"],
+  ["vienna", "wien"],
+  ["prague", "praha"],
+  ["brussels", "bruxelles", "brussel"],
+  ["lisbon", "lisboa"],
+  ["seville", "sevilla"],
+  ["copenhagen", "kobenhavn", "koebenhavn"],
+];
+
+function citiesEquivalent(a, b) {
+  const na = normalizeCityToken(a);
+  const nb = normalizeCityToken(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na.includes(nb) || nb.includes(na)) return true;
+  for (const group of CITY_ALIAS_GROUPS) {
+    if (group.includes(na) && group.includes(nb)) return true;
+  }
+  return false;
+}
+
+function radiusKmForSuggestion(suggestion) {
+  const type = suggestion?.type || "destination";
+  if (type === "hotel") return 5;
+  if (type === "airport") return 45;
+  if (type === "poi") return 35;
+  // City / destination: match Go Hilton “place + nearby” (Malpensa, Monza, Como, …).
+  return 100;
+}
+
+function placeFromSuggestion(suggestion, fallbackQuery = "") {
+  if (!suggestion) return null;
+  const city = suggestion.city || suggestion.primary || null;
+  const country = suggestion.country || "";
+  const countryCode = String(suggestion.countryCode || "").toUpperCase() || null;
+  return {
+    lat: suggestion.lat ?? null,
+    lon: suggestion.lon ?? null,
+    displayName: suggestion.label || suggestion.query || fallbackQuery,
+    city,
+    country,
+    countryCode,
+    state: suggestion.state || "",
+    suggestionType: suggestion.type || "destination",
+    placeId: suggestion.placeId || null,
+    ctyhocn: suggestion.ctyhocn || null,
+  };
+}
+
+/**
+ * Prefer Hilton autocomplete picks the same way the Go Hilton "Where to?" box does:
+ * exact city/destination match first, then hotels, then airports/POIs.
+ */
+function pickBestSuggestion(suggestions, query) {
+  const list = Array.isArray(suggestions) ? suggestions : [];
+  if (!list.length) return null;
+  const q = String(query || "").trim().toLowerCase();
+  const scored = list.map((s) => {
+    const primary = String(s.primary || "").toLowerCase();
+    const label = String(s.label || s.query || "").toLowerCase();
+    const city = String(s.city || "").toLowerCase();
+    let score = 0;
+    if (primary === q || label === q || city === q) score += 120;
+    if (primary.startsWith(q) || city.startsWith(q)) score += 60;
+    if (label.includes(q)) score += 20;
+    if (s.type === "destination") score += 40;
+    else if (s.type === "hotel") score += 25;
+    else if (s.type === "airport") score += 10;
+    else if (s.type === "poi") score += 8;
+    else if (s.type === "region") score -= 50;
+    return { s, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0]?.score > 0 ? scored[0].s : list[0];
+}
+
+async function resolveDestinationSuggestion(destination, suggestion = null) {
+  if (suggestion?.ctyhocn || suggestion?.city || suggestion?.placeId || suggestion?.query) {
+    return suggestion;
+  }
+  const q = String(destination || "").trim();
+  if (q.length < 2) return null;
+  try {
+    const { suggestions } = await autocompleteDestination(q, { limit: 8 });
+    return pickBestSuggestion(suggestions, q);
+  } catch {
+    return null;
+  }
+}
+
+function filterHotelsToDestination(hotels, place, suggestion) {
+  const radiusKm = radiusKmForSuggestion(suggestion);
+  const withDistance = sortHotelsByDistance(hotels, place);
+  const targetCity = place?.city || suggestion?.city || suggestion?.primary;
+
+  // Go Hilton style: keep anything within radius of the place center.
+  const nearby = withDistance.filter((h) => {
+    const d = Number(h.distance);
+    if (Number.isFinite(d)) return d <= radiusKm;
+    // No usable distance — only keep clear same-city hits (avoid far unknowns).
+    return targetCity ? citiesEquivalent(h.city, targetCity) : false;
+  });
+
+  if (nearby.length) {
+    // Same-city first, then nearer suburbs — still all within radius.
+    return nearby.sort((a, b) => {
+      const aCity = targetCity && citiesEquivalent(a.city, targetCity) ? 0 : 1;
+      const bCity = targetCity && citiesEquivalent(b.city, targetCity) ? 0 : 1;
+      if (aCity !== bCity) return aCity - bCity;
+      return (a.distance ?? 1e9) - (b.distance ?? 1e9);
+    });
+  }
+
+  const hardCap = Math.max(radiusKm * 1.25, 120);
+  return withDistance.filter((h) => {
+    const d = Number(h.distance);
+    return Number.isFinite(d) && d <= hardCap;
+  });
+}
+
+async function fetchHotelsInQuadrants(place, { maxQuadrants = 2 } = {}) {
+  if (place?.lat == null || place?.lon == null) return [];
+  const quadrants = await loadHotelQuadrants();
+  const matches = findContainingQuadrantIds(place.lat, place.lon, quadrants);
+  if (!matches.length) return [];
+  const local = matches.filter((m) => m.depth >= 3);
+  const use = (local.length ? local : matches).slice(0, maxQuadrants);
+  const seen = new Set();
+  const hotels = [];
+  for (const match of use) {
+    const json = await hiltonGraphql(
+      "hotelSummaryOptions",
+      HOTEL_SUMMARY_QUERY,
+      {
+        language: "en",
+        input: {
+          quadrantId: match.id,
+          guestLocationCountry: place.countryCode || "US",
+        },
+      },
+      "dx_shop_search_app"
+    );
+    for (const h of (json?.data?.hotelSummaryOptions?.hotels || []).map(normalizeHotel).filter(Boolean)) {
+      if (seen.has(h.ctyhocn)) continue;
+      seen.add(h.ctyhocn);
+      hotels.push(h);
+    }
+  }
+  return hotels;
+}
+
+async function searchHotelsNearDestination(destination, { limit = 30, suggestion = null } = {}) {
+  const resolved = await resolveDestinationSuggestion(destination, suggestion);
+  if (resolved?.ctyhocn) {
+    const place = placeFromSuggestion(resolved, destination) || {
+      displayName: resolved.primary || destination,
+      city: resolved.city,
+      country: resolved.country,
+      countryCode: resolved.countryCode,
+    };
+    return {
+      place,
+      hotels: [
+        {
+          ctyhocn: String(resolved.ctyhocn).toUpperCase(),
+          name: resolved.primary || resolved.label || resolved.ctyhocn,
+          brandCode: null,
+          distance: 0,
+          city: resolved.city || null,
+          country: resolved.country || null,
+          state: resolved.state || null,
+          lat: null,
+          lon: null,
+        },
+      ],
+      resolvedSuggestion: resolved,
+    };
+  }
+
+  // Prefer Hilton autocomplete locality over raw Nominatim free-text.
+  let place = placeFromSuggestion(resolved, destination);
+  const queryForGeo =
+    resolved?.query ||
+    [resolved?.primary, resolved?.secondary].filter(Boolean).join(", ") ||
+    destination;
+
+  try {
+    const geo = await geocodeDestination(queryForGeo);
+    place = {
+      ...(place || {}),
+      ...geo,
+      city: place?.city || geo.city,
+      country: place?.country || geo.country,
+      countryCode: place?.countryCode || geo.countryCode,
+      state: place?.state || geo.state,
+      displayName: place?.displayName || geo.displayName,
+      suggestionType: resolved?.type || "destination",
+    };
+  } catch (err) {
+    if (!place?.city && !place?.countryCode) throw err;
+  }
+
   const countryPath = countryPathName(place.country, place.countryCode);
-  const citySlug = slugify(place.city);
+  const citySlug = slugify(place.city || resolved?.primary || destination);
   const stateSlug = slugify(place.state);
   const paths = [
-    `/en/locations/${countryPath}/${citySlug}/`,
-    stateSlug ? `/en/locations/${countryPath}/${stateSlug}/${citySlug}/` : null,
-    stateSlug ? `/en/locations/${countryPath}/${stateSlug}/` : null,
+    citySlug ? `/en/locations/${countryPath}/${citySlug}/` : null,
+    citySlug && stateSlug ? `/en/locations/${countryPath}/${stateSlug}/${citySlug}/` : null,
   ].filter(Boolean);
 
+  const seen = new Set();
   let hotels = [];
   let lastError = null;
+  let sourceParts = [];
+
+  const addHotels = (list, source) => {
+    let added = 0;
+    for (const h of list || []) {
+      if (!h?.ctyhocn || seen.has(h.ctyhocn)) continue;
+      seen.add(h.ctyhocn);
+      hotels.push(h);
+      added += 1;
+    }
+    if (added) sourceParts.push(source);
+  };
 
   for (const path of paths) {
     try {
@@ -1066,58 +1295,42 @@ async function searchHotelsNearDestination(destination, { limit = 30 } = {}) {
           language: "en",
           path,
           distanceUnit: "kilometer",
-          input: { guestLocationCountry: place.countryCode },
+          input: { guestLocationCountry: place.countryCode || "US" },
         },
         "dx_shop_search_app"
       );
       const list = json?.data?.geocodePage?.hotelSummaryOptions?.hotels || [];
-      hotels = list.map(normalizeHotel).filter(Boolean);
+      addHotels(list.map(normalizeHotel).filter(Boolean), `geocodePage:${path}`);
       if (hotels.length) break;
     } catch (err) {
       lastError = err;
     }
   }
 
-  // Hilton map search uses quadrantId (not lat/lon) on HotelSummaryOptionsInput
-  if (!hotels.length) {
+  // Always merge local map-quadrant hotels so “nearby” (Malpensa, Monza, Como, …) are candidates,
+  // then radius-filter. City pages alone often omit those suburbs.
+  if (place.lat != null && place.lon != null) {
     try {
-      const quadrants = await loadHotelQuadrants();
-      const matches = findContainingQuadrantIds(place.lat, place.lon, quadrants);
-      if (!matches.length) {
-        throw new Error(`No Hilton map quadrant found for “${place.displayName || destination}”.`);
-      }
-      const seen = new Set();
-      for (const match of matches.slice(0, 3)) {
-        const json = await hiltonGraphql(
-          "hotelSummaryOptions",
-          HOTEL_SUMMARY_QUERY,
-          {
-            language: "en",
-            input: {
-              quadrantId: match.id,
-              guestLocationCountry: place.countryCode,
-            },
-          },
-          "dx_shop_search_app"
-        );
-        for (const h of (json?.data?.hotelSummaryOptions?.hotels || []).map(normalizeHotel).filter(Boolean)) {
-          if (seen.has(h.ctyhocn)) continue;
-          seen.add(h.ctyhocn);
-          hotels.push(h);
-        }
-        if (hotels.length >= limit) break;
-      }
+      const quadrantHotels = await fetchHotelsInQuadrants(place, { maxQuadrants: 2 });
+      addHotels(quadrantHotels, "quadrant");
     } catch (err) {
       lastError = err;
     }
   }
 
+  hotels = filterHotelsToDestination(hotels, place, resolved);
+
   if (!hotels.length) {
-    throw lastError || new Error("No Hilton hotels found for that destination.");
+    throw lastError || new Error(`No Hilton hotels found near “${place.displayName || destination}”.`);
   }
 
-  hotels = sortHotelsByDistance(hotels, place).slice(0, limit);
-  return { place, hotels };
+  hotels = hotels.slice(0, limit);
+  return {
+    place,
+    hotels,
+    resolvedSuggestion: resolved,
+    source: sourceParts.join("+") || null,
+  };
 }
 
 async function fetchCalendar({
@@ -1431,13 +1644,16 @@ async function autocompleteDestination(query, { limit = 8 } = {}) {
 
     const placeId = p.place_id || null;
     const hotelMatch = typeof placeId === "string" ? placeId.match(/^dx-hotel::([a-z0-9]+)$/i) : null;
-    const type = hotelMatch
+    const rawType = String(p.type || "").toLowerCase();
+    const type = hotelMatch || rawType === "property"
       ? "hotel"
-      : p.type === "airport"
+      : rawType === "airport"
         ? "airport"
-        : p.type === "pointOfInterest"
+        : rawType === "pointofinterest" || rawType === "poi"
           ? "poi"
-          : "destination";
+          : rawType === "region"
+            ? "region"
+            : "destination"; // Hilton city hits often use type "geocode"
 
     suggestions.push({
       id: placeId || `${type}:${p.description}`,

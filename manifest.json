@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "go+",
-  "version": "0.8.6",
+  "version": "0.8.8",
   "description": "Go Hilton availability search engine.",
   "incognito": "split",
   "permissions": [

@@ -25,6 +25,7 @@ const state = {
   roomSortKey: "amount",
   roomSortDir: "asc",
   dowSelected: new Set(),
+  citySelected: new Set(),
   expanded: new Set(),
   roomDetails: new Map(),
   recentSearches: [],
@@ -567,6 +568,129 @@ function filterByDow(rows) {
   return rows.filter((row) => state.dowSelected.has(arrivalWeekday(row.arrivalDate)));
 }
 
+function rowCity(row) {
+  const city = String(row?.city || "").trim();
+  return city || "—";
+}
+
+function availableCities(rows = state.allRows) {
+  return [...new Set((rows || []).map(rowCity))].sort((a, b) => a.localeCompare(b));
+}
+
+function filterByCity(rows) {
+  if (!state.citySelected.size) return rows;
+  return rows.filter((row) => state.citySelected.has(rowCity(row)));
+}
+
+function filterResultRows(rows) {
+  return filterByCity(filterByDow(rows));
+}
+
+function pruneCitySelection(cities) {
+  if (!state.citySelected.size) return;
+  const allowed = new Set(cities);
+  state.citySelected = new Set([...state.citySelected].filter((c) => allowed.has(c)));
+}
+
+function updateCityFilterUi() {
+  const trigger = $("cityFilterTrigger");
+  const meta = $("cityFilterMeta");
+  if (!trigger || !meta) return;
+  const cities = availableCities();
+  pruneCitySelection(cities);
+  const count = state.citySelected.size;
+  trigger.classList.toggle("has-filter", count > 0);
+  trigger.disabled = !cities.length;
+  if (!count) {
+    meta.textContent = "";
+  } else if (count <= 2) {
+    meta.textContent = [...state.citySelected].sort((a, b) => a.localeCompare(b)).join(", ");
+  } else {
+    meta.textContent = `${count} cities`;
+  }
+  renderCityFilterList(cities);
+}
+
+function renderCityFilterList(cities = availableCities()) {
+  const list = $("cityFilterList");
+  if (!list) return;
+  if (!cities.length) {
+    list.innerHTML = `<div class="city-filter-empty">No cities in results</div>`;
+    return;
+  }
+  list.innerHTML = cities
+    .map((city) => {
+      const checked = state.citySelected.has(city) ? " checked" : "";
+      return `<label>
+        <input type="checkbox" value="${escapeHtml(city)}"${checked} />
+        <span>${escapeHtml(city)}</span>
+      </label>`;
+    })
+    .join("");
+}
+
+function syncCityFilterFromDom() {
+  const list = $("cityFilterList");
+  if (!list) return;
+  state.citySelected = new Set(
+    [...list.querySelectorAll("input[type=checkbox]:checked")].map((el) => el.value)
+  );
+  updateCityFilterUi();
+  refreshTable();
+}
+
+function positionCityFilterPanel() {
+  const trigger = $("cityFilterTrigger");
+  const panel = $("cityFilterPanel");
+  if (!trigger || !panel || panel.hidden) return;
+  const rect = trigger.getBoundingClientRect();
+  const width = 220;
+  const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8);
+  panel.style.left = `${left}px`;
+  panel.style.top = `${rect.bottom + 6}px`;
+  panel.style.width = `${width}px`;
+}
+
+function setCityFilterOpen(open) {
+  const panel = $("cityFilterPanel");
+  const trigger = $("cityFilterTrigger");
+  if (!panel || !trigger) return;
+  if (open) {
+    setDowOpen(false);
+    renderCityFilterList();
+  }
+  panel.hidden = !open;
+  trigger.setAttribute("aria-expanded", open ? "true" : "false");
+  const chevron = trigger.querySelector(".city-filter-chevron");
+  if (chevron) chevron.textContent = open ? "▴" : "▾";
+  if (open) positionCityFilterPanel();
+}
+
+function setupCityFilter() {
+  const trigger = $("cityFilterTrigger");
+  const panel = $("cityFilterPanel");
+  const list = $("cityFilterList");
+  const reset = $("cityFilterReset");
+  if (!trigger || !panel || !list || !reset) return;
+
+  trigger.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (trigger.disabled) return;
+    setCityFilterOpen(panel.hidden);
+  });
+  panel.addEventListener("click", (e) => e.stopPropagation());
+  list.addEventListener("change", syncCityFilterFromDom);
+  reset.addEventListener("click", () => {
+    state.citySelected = new Set();
+    updateCityFilterUi();
+    refreshTable();
+  });
+  window.addEventListener("resize", () => {
+    if (!panel.hidden) positionCityFilterPanel();
+  });
+  updateCityFilterUi();
+}
+
 function updateDowUi() {
   const trigger = $("dowTrigger");
   const meta = $("dowTriggerMeta");
@@ -598,6 +722,7 @@ function setDowOpen(open) {
   $("dowPanel").hidden = !open;
   $("dowTrigger").setAttribute("aria-expanded", open ? "true" : "false");
   $("dowTrigger").querySelector(".dow-chevron").textContent = open ? "▴" : "▾";
+  if (open) setCityFilterOpen(false);
 }
 
 function setupDowFilter() {
@@ -614,7 +739,10 @@ function setupDowFilter() {
     writeParams(formValues());
     refreshTable();
   });
-  document.addEventListener("click", () => setDowOpen(false));
+  document.addEventListener("click", () => {
+    setDowOpen(false);
+    setCityFilterOpen(false);
+  });
 }
 
 function rowKey(row) {
@@ -1154,7 +1282,8 @@ function scanErrorsHtml(errors) {
 }
 
 function refreshTable() {
-  const filtered = filterByDow(state.allRows);
+  updateCityFilterUi();
+  const filtered = filterResultRows(state.allRows);
   state.rows = sortedRows(filtered);
   const validKeys = new Set(state.rows.map(rowKey));
   state.expanded = new Set([...state.expanded].filter((k) => validKeys.has(k)));
@@ -1163,9 +1292,14 @@ function refreshTable() {
   $("exportBtn").disabled = !state.rows.length;
   updateSortHeaders();
 
+  const filtersActive =
+    state.dowSelected.size > 0 || state.citySelected.size > 0;
+
   if (!state.rows.length) {
     let emptyMsg = state.allRows.length
-      ? "No nights match the Day of Week filter."
+      ? filtersActive
+        ? "No nights match the current filters."
+        : "No matching Go rates in range."
       : state.scanErrors.length
         ? `No matching nights. ${state.scanErrors.length} hotel request(s) failed.`
         : "No matching Go rates in range.";
@@ -1181,7 +1315,7 @@ function refreshTable() {
   }
 
   const label =
-    state.dowSelected.size && state.rows.length !== state.allRows.length
+    filtersActive && state.rows.length !== state.allRows.length
       ? `${state.rows.length} shown · ${state.allRows.length} total · ${new Set(state.rows.map((r) => r.ctyhocn)).size} hotels`
       : `${state.rows.length} nights · ${new Set(state.rows.map((r) => r.ctyhocn)).size} hotels`;
   $("resultsLabel").textContent = state.scanErrors.length
@@ -1603,6 +1737,30 @@ function selectSuggestion(item) {
   hideSuggestions();
 }
 
+/** Mirror Hilton "Where to?" ranking for free-text submit. */
+function pickBestDestinationSuggestion(suggestions, query) {
+  const list = Array.isArray(suggestions) ? suggestions : [];
+  if (!list.length) return null;
+  const q = String(query || "").trim().toLowerCase();
+  const scored = list.map((s) => {
+    const primary = String(s.primary || "").toLowerCase();
+    const label = String(s.label || s.query || "").toLowerCase();
+    const city = String(s.city || "").toLowerCase();
+    let score = 0;
+    if (primary === q || label === q || city === q) score += 120;
+    if (primary.startsWith(q) || city.startsWith(q)) score += 60;
+    if (label.includes(q)) score += 20;
+    if (s.type === "destination") score += 40;
+    else if (s.type === "hotel") score += 25;
+    else if (s.type === "airport") score += 10;
+    else if (s.type === "poi") score += 8;
+    else if (s.type === "region") score -= 50;
+    return { s, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0]?.score > 0 ? scored[0].s : list[0];
+}
+
 async function fetchSuggestions(query) {
   const reqId = ++state.suggestReq;
   const res = await sendMessage({
@@ -1721,6 +1879,7 @@ async function runSearch(event) {
   state.roomsSectionOpen.clear();
   state.roomDescOpen.clear();
   state.refreshingKeys.clear();
+  state.citySelected.clear();
   setScanningUi(true);
   setProgress(0);
   hideSuggestions();
@@ -1735,7 +1894,28 @@ async function runSearch(event) {
     }
 
     let hotels = [];
-    const picked = state.selectedSuggestion;
+    let picked = state.selectedSuggestion;
+
+    // Match Go Hilton: resolve free text through Hilton autocomplete when nothing is selected.
+    if (!picked && values.destination) {
+      setStatus(`Resolving “${values.destination}”…`);
+      const ac = await sendMessage({
+        type: "AUTOCOMPLETE_DESTINATION",
+        query: values.destination,
+        limit: 8,
+      });
+      if (state.stopRequested || ac.cancelled) {
+        setStatus("Stopped.");
+        return;
+      }
+      if (ac.ok && ac.suggestions?.length) {
+        picked = pickBestDestinationSuggestion(ac.suggestions, values.destination);
+        if (picked) {
+          state.selectedSuggestion = picked;
+          $("destination").value = picked.query || picked.label || picked.primary || values.destination;
+        }
+      }
+    }
 
     if (picked?.type === "hotel" && picked.ctyhocn) {
       hotels = [
@@ -1755,6 +1935,7 @@ async function runSearch(event) {
       const hotelRes = await sendMessage({
         type: "SEARCH_DESTINATION_HOTELS",
         destination,
+        suggestion: picked,
         limit: values.maxHotels,
       });
       if (state.stopRequested || hotelRes.cancelled) {
@@ -1769,8 +1950,12 @@ async function runSearch(event) {
         throw new Error(hotelRes.error || "Hotel search failed");
       }
       hotels = hotelRes.hotels || [];
+      const placeLabel =
+        hotelRes.place?.displayName ||
+        hotelRes.resolvedSuggestion?.label ||
+        destination;
       setStatus(
-        `Found ${hotels.length} hotels near ${hotelRes.place?.displayName || destination}. Scanning calendars…`
+        `Found ${hotels.length} hotels near ${placeLabel}. Scanning calendars…`
       );
     }
 
@@ -1945,6 +2130,7 @@ async function boot() {
   });
   updateSortHeaders();
   setupDowFilter();
+  setupCityFilter();
   setupDestinationAutocomplete();
   setupReauthHandling();
   setupMetricsSession();

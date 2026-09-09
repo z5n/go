@@ -272,6 +272,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       scanCancelled = false;
       const result = await searchHotelsNearDestination(message.destination, {
         limit: message.limit || 25,
+        suggestion: message.suggestion || null,
       });
       if (scanCancelled) {
         sendResponse({ ok: true, ...result, cancelled: true });

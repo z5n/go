@@ -6,7 +6,7 @@ Search UI for **Go Hilton** Friends & Family / Team Member availability.
 
 - Web app (`web/`) with destination + date range + filters + results table + CSV export
 - Same Hilton calendar GraphQL the extension already uses: `hotel_shopAvailOptions_shopCalendarPropAvail`
-- Hotel discovery via destination geocode + Hilton hotel summary GraphQL
+- Hotel discovery via Hilton autocomplete (same “Where to?” API) + city-scoped hotel summary
 - Runs inside the extension so your signed-in Hilton cookies are used
 
 ## Install
