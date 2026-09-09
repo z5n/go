@@ -1,3 +1,8 @@
+import {
+  setupDatePickers,
+  refreshDatePickers,
+} from "./calendar.js";
+
 const $ = (id) => document.getElementById(id);
 
 const DAY_NAMES = {
@@ -25,7 +30,14 @@ const state = {
   roomSortKey: "amount",
   roomSortDir: "asc",
   dowSelected: new Set(),
-  citySelected: new Set(),
+  columnFilters: {
+    arrivalDate: new Set(),
+    hotelName: new Set(),
+    brandCode: new Set(),
+    city: new Set(),
+    specialRateType: new Set(),
+  },
+  openColumnFilter: null,
   expanded: new Set(),
   roomDetails: new Map(),
   recentSearches: [],
@@ -42,32 +54,33 @@ const state = {
 
 const RECENT_SEARCHES_KEY = "recentSearches";
 const MAX_RECENT_SEARCHES = 8;
-const ROOM_FETCH_CONCURRENCY = 3;
+const ROOM_FETCH_CONCURRENCY = 1;
+const ROOM_FETCH_DELAY_MS = 750;
+const SCAN_DELAY_MS = 1000;
 const METRICS_SESSION_ID =
   globalThis.crypto?.randomUUID?.() || `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+/** Local calendar date as YYYY-MM-DD (avoid UTC shifts from toISOString). */
+function formatLocalISO(date) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
 function todayISO() {
-  const d = new Date();
-  return d.toISOString().slice(0, 10);
+  return formatLocalISO(new Date());
 }
 
 function addDaysISO(iso, days) {
   const d = new Date(`${iso}T00:00:00`);
-  d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
+  d.setDate(d.getDate() + Number(days || 0));
+  return formatLocalISO(d);
 }
 
 function readParams() {
   const params = new URLSearchParams(location.search);
-  const daysRaw = params.get("days") || "";
-  const dowSelected = new Set(
-    daysRaw
-      .split(",")
-      .map((v) => v.trim())
-      .filter((v) => v !== "" && !Number.isNaN(Number(v)))
-      .map((v) => Number(v))
-      .filter((n) => n >= 0 && n <= 6)
-  );
   return {
     destination: params.get("destination") || params.get("destinations") || "",
     fromDate: params.get("from") || params.get("date") || "",
@@ -75,10 +88,7 @@ function readParams() {
     nights: Number(params.get("nights") || 1),
     maxRate: params.get("max_rate") || params.get("max_fees") || "",
     minRooms: Number(params.get("min_rooms") || params.get("min_seats") || 1),
-    maxHotels: Number(params.get("hotels") || 20),
-    goOnly: params.get("go_only") === "true",
     rateType: params.get("rate_type") || "fnf",
-    dowSelected,
   };
 }
 
@@ -90,12 +100,7 @@ function writeParams(values) {
   if (values.nights) params.set("nights", String(values.nights));
   if (values.maxRate !== "" && values.maxRate != null) params.set("max_rate", String(values.maxRate));
   if (values.minRooms) params.set("min_rooms", String(values.minRooms));
-  if (values.maxHotels) params.set("hotels", String(values.maxHotels));
-  params.set("go_only", values.goOnly ? "true" : "false");
   params.set("rate_type", values.rateType);
-  if (state.dowSelected.size) {
-    params.set("days", [...state.dowSelected].sort((a, b) => a - b).join(","));
-  }
   history.replaceState(null, "", `${location.pathname}?${params.toString()}`);
 }
 
@@ -202,16 +207,17 @@ function setupMetricsSession() {
 }
 
 function formValues() {
+  const nightsRaw = $("nights").value;
+  const rateType = $("rateType")?.value === "tm" ? "tm" : "fnf";
   return {
     destination: $("destination").value.trim(),
     fromDate: $("fromDate").value,
     toDate: $("toDate").value,
-    nights: Number($("nights").value || 1),
+    nights: nightsRaw === "" ? null : Number(nightsRaw || 1),
     maxRate: $("maxRate").value === "" ? null : Number($("maxRate").value),
     minRooms: Number($("minRooms").value || 1),
-    maxHotels: Number($("maxHotels").value || 20),
-    goOnly: $("goOnly").checked,
-    rateType: $("rateType").value,
+    goOnly: false,
+    rateType,
   };
 }
 
@@ -356,8 +362,8 @@ function findNextHigherDifferentPlan(base, candidates = []) {
 
 function rateDisplayHtml(amount, currency, amountFmt, nights, compareWith = null) {
   const nightly = formatMoneyAmount(amount, currency, amountFmt);
-  const n = Math.max(1, Number(nights) || 1);
-  const estimate = formatStayEstimate(amount, currency, n);
+  const showStay = nights != null && Number(nights) > 0;
+  const estimate = showStay ? formatStayEstimate(amount, currency, nights) : null;
 
   let compareStrike = "";
   if (compareWith?.amount != null && amount != null) {
@@ -565,130 +571,279 @@ function arrivalWeekday(isoDate) {
 
 function filterByDow(rows) {
   if (!state.dowSelected.size) return rows;
-  return rows.filter((row) => state.dowSelected.has(arrivalWeekday(row.arrivalDate)));
+  return rows.filter((row) => {
+    if (row.inventoryOnly || !row.arrivalDate) return true;
+    return state.dowSelected.has(arrivalWeekday(row.arrivalDate));
+  });
 }
 
-function rowCity(row) {
-  const city = String(row?.city || "").trim();
-  return city || "—";
+const COLUMN_FILTERS = [
+  {
+    id: "arrivalDate",
+    sortKey: "arrivalDate",
+    label: "Check-in",
+    plural: "dates",
+    panelWidth: 200,
+    value: (row) => String(row?.arrivalDate || "").trim() || "—",
+  },
+  {
+    id: "hotelName",
+    sortKey: "hotelName",
+    label: "Hotel",
+    plural: "hotels",
+    panelWidth: 280,
+    value: (row) =>
+      String(row?.hotelName || "").trim() ||
+      String(row?.ctyhocn || "").trim() ||
+      "—",
+  },
+  {
+    id: "brandCode",
+    sortKey: "brandCode",
+    label: "Brand",
+    plural: "brands",
+    panelWidth: 160,
+    value: (row) => String(row?.brandCode || "").trim() || "—",
+  },
+  {
+    id: "city",
+    sortKey: "city",
+    label: "City",
+    plural: "cities",
+    panelWidth: 220,
+    value: (row) => String(row?.city || "").trim() || "—",
+  },
+  {
+    id: "specialRateType",
+    sortKey: "specialRateType",
+    label: "Rate",
+    plural: "rates",
+    panelWidth: 200,
+    value: (row) => {
+      if (row?.inventoryOnly && !row.stayPriced) return "lead";
+      if (row?.isGoRate) return String(row.specialRateType || "go").trim() || "go";
+      return String(row?.specialRateType || "other").trim() || "other";
+    },
+  },
+];
+
+function columnFilterDef(id) {
+  return COLUMN_FILTERS.find((c) => c.id === id) || null;
 }
 
-function availableCities(rows = state.allRows) {
-  return [...new Set((rows || []).map(rowCity))].sort((a, b) => a.localeCompare(b));
+function columnFilterSelected(id) {
+  if (!state.columnFilters[id]) state.columnFilters[id] = new Set();
+  return state.columnFilters[id];
 }
 
-function filterByCity(rows) {
-  if (!state.citySelected.size) return rows;
-  return rows.filter((row) => state.citySelected.has(rowCity(row)));
+function availableColumnValues(id) {
+  const def = columnFilterDef(id);
+  if (!def) return [];
+  return [...new Set(rowsMatchingFiltersExcept(id).map((row) => def.value(row)))].sort((a, b) =>
+    a.localeCompare(b)
+  );
+}
+
+/** Rows after DOW + all column filters except `excludeId` (cascading option lists). */
+function rowsMatchingFiltersExcept(excludeId = null) {
+  let rows = filterByDow(state.allRows || []);
+  for (const def of COLUMN_FILTERS) {
+    if (excludeId && def.id === excludeId) continue;
+    const selected = columnFilterSelected(def.id);
+    if (!selected.size) continue;
+    rows = rows.filter((row) => selected.has(def.value(row)));
+  }
+  return rows;
+}
+
+function anyColumnFilterActive() {
+  return COLUMN_FILTERS.some((c) => columnFilterSelected(c.id).size > 0);
+}
+
+function filterByColumnFilters(rows) {
+  let out = rows;
+  for (const def of COLUMN_FILTERS) {
+    const selected = columnFilterSelected(def.id);
+    if (!selected.size) continue;
+    out = out.filter((row) => selected.has(def.value(row)));
+  }
+  return out;
 }
 
 function filterResultRows(rows) {
-  return filterByCity(filterByDow(rows));
+  return filterByColumnFilters(filterByDow(rows));
 }
 
-function pruneCitySelection(cities) {
-  if (!state.citySelected.size) return;
-  const allowed = new Set(cities);
-  state.citySelected = new Set([...state.citySelected].filter((c) => allowed.has(c)));
+function pruneColumnSelection(id, values) {
+  const selected = columnFilterSelected(id);
+  if (!selected.size) return false;
+  const allowed = new Set(values);
+  const next = new Set([...selected].filter((v) => allowed.has(v)));
+  const changed = next.size !== selected.size;
+  state.columnFilters[id] = next;
+  return changed;
 }
 
-function updateCityFilterUi() {
-  const trigger = $("cityFilterTrigger");
-  const meta = $("cityFilterMeta");
-  if (!trigger || !meta) return;
-  const cities = availableCities();
-  pruneCitySelection(cities);
-  const count = state.citySelected.size;
-  trigger.classList.toggle("has-filter", count > 0);
-  trigger.disabled = !cities.length;
-  if (!count) {
-    meta.textContent = "";
-  } else if (count <= 2) {
-    meta.textContent = [...state.citySelected].sort((a, b) => a.localeCompare(b)).join(", ");
-  } else {
-    meta.textContent = `${count} cities`;
+function clearColumnFilters() {
+  for (const def of COLUMN_FILTERS) {
+    state.columnFilters[def.id] = new Set();
   }
-  renderCityFilterList(cities);
+  state.openColumnFilter = null;
 }
 
-function renderCityFilterList(cities = availableCities()) {
-  const list = $("cityFilterList");
+function updateColumnFilterUi(id = null) {
+  // Always refresh every column so options cascade when one filter changes.
+  void id;
+  // Prune in passes so interdependent selections settle (e.g. city then hotel).
+  for (let pass = 0; pass < COLUMN_FILTERS.length; pass += 1) {
+    let changed = false;
+    for (const def of COLUMN_FILTERS) {
+      const values = availableColumnValues(def.id);
+      if (pruneColumnSelection(def.id, values)) changed = true;
+    }
+    if (!changed) break;
+  }
+
+  for (const def of COLUMN_FILTERS) {
+    const trigger = document.querySelector(
+      `.col-filter-trigger[data-col-filter="${def.id}"]`
+    );
+    const meta = document.querySelector(
+      `.col-filter-meta[data-col-filter-meta="${def.id}"]`
+    );
+    if (!trigger || !meta) continue;
+    const values = availableColumnValues(def.id);
+    const selected = columnFilterSelected(def.id);
+    const count = selected.size;
+    trigger.classList.toggle("has-filter", count > 0);
+    trigger.disabled = !values.length;
+    if (!count) {
+      meta.textContent = "";
+    } else if (count <= 2) {
+      meta.textContent = [...selected].sort((a, b) => a.localeCompare(b)).join(", ");
+    } else {
+      meta.textContent = `${count} ${def.plural}`;
+    }
+    renderColumnFilterList(def.id, values);
+  }
+}
+
+function renderColumnFilterList(id, values = availableColumnValues(id)) {
+  const list = document.querySelector(`.col-filter-list[data-col-filter-list="${id}"]`);
   if (!list) return;
-  if (!cities.length) {
-    list.innerHTML = `<div class="city-filter-empty">No cities in results</div>`;
+  const def = columnFilterDef(id);
+  if (!values.length) {
+    list.innerHTML = `<div class="col-filter-empty">No ${def?.plural || "values"} in results</div>`;
     return;
   }
-  list.innerHTML = cities
-    .map((city) => {
-      const checked = state.citySelected.has(city) ? " checked" : "";
+  const selected = columnFilterSelected(id);
+  list.innerHTML = values
+    .map((value) => {
+      const checked = selected.has(value) ? " checked" : "";
       return `<label>
-        <input type="checkbox" value="${escapeHtml(city)}"${checked} />
-        <span>${escapeHtml(city)}</span>
+        <input type="checkbox" value="${escapeHtml(value)}"${checked} />
+        <span>${escapeHtml(value)}</span>
       </label>`;
     })
     .join("");
 }
 
-function syncCityFilterFromDom() {
-  const list = $("cityFilterList");
+function syncColumnFilterFromDom(id) {
+  const list = document.querySelector(`.col-filter-list[data-col-filter-list="${id}"]`);
   if (!list) return;
-  state.citySelected = new Set(
+  state.columnFilters[id] = new Set(
     [...list.querySelectorAll("input[type=checkbox]:checked")].map((el) => el.value)
   );
-  updateCityFilterUi();
-  refreshTable();
+  // Defer rebuild so we don't remove the checkbox mid-click (which cancels the toggle
+  // / retargets the click to document and makes options feel dead).
+  requestAnimationFrame(() => refreshTable());
 }
 
-function positionCityFilterPanel() {
-  const trigger = $("cityFilterTrigger");
-  const panel = $("cityFilterPanel");
-  if (!trigger || !panel || panel.hidden) return;
+function positionColumnFilterPanel(id) {
+  const trigger = document.querySelector(`.col-filter-trigger[data-col-filter="${id}"]`);
+  const panel = document.querySelector(`.col-filter-panel[data-col-filter-panel="${id}"]`);
+  const def = columnFilterDef(id);
+  if (!trigger || !panel || panel.hidden || !def) return;
   const rect = trigger.getBoundingClientRect();
-  const width = 220;
+  const width = def.panelWidth || 220;
   const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8);
   panel.style.left = `${left}px`;
   panel.style.top = `${rect.bottom + 6}px`;
   panel.style.width = `${width}px`;
 }
 
-function setCityFilterOpen(open) {
-  const panel = $("cityFilterPanel");
-  const trigger = $("cityFilterTrigger");
-  if (!panel || !trigger) return;
-  if (open) {
-    setDowOpen(false);
-    renderCityFilterList();
+function setColumnFilterOpen(id, open) {
+  for (const def of COLUMN_FILTERS) {
+    const panel = document.querySelector(
+      `.col-filter-panel[data-col-filter-panel="${def.id}"]`
+    );
+    const trigger = document.querySelector(
+      `.col-filter-trigger[data-col-filter="${def.id}"]`
+    );
+    if (!panel || !trigger) continue;
+    const isOpen = Boolean(open) && def.id === id;
+    if (isOpen) {
+      setDowOpen(false);
+      renderColumnFilterList(def.id);
+    }
+    panel.hidden = !isOpen;
+    trigger.setAttribute("aria-expanded", isOpen ? "true" : "false");
+    if (isOpen) positionColumnFilterPanel(def.id);
   }
-  panel.hidden = !open;
-  trigger.setAttribute("aria-expanded", open ? "true" : "false");
-  const chevron = trigger.querySelector(".city-filter-chevron");
-  if (chevron) chevron.textContent = open ? "▴" : "▾";
-  if (open) positionCityFilterPanel();
+  state.openColumnFilter = open ? id : null;
 }
 
-function setupCityFilter() {
-  const trigger = $("cityFilterTrigger");
-  const panel = $("cityFilterPanel");
-  const list = $("cityFilterList");
-  const reset = $("cityFilterReset");
-  if (!trigger || !panel || !list || !reset) return;
+function closeAllColumnFilters() {
+  setColumnFilterOpen(null, false);
+}
 
-  trigger.addEventListener("click", (e) => {
-    e.stopPropagation();
-    if (trigger.disabled) return;
-    setCityFilterOpen(panel.hidden);
-  });
-  panel.addEventListener("click", (e) => e.stopPropagation());
-  list.addEventListener("change", syncCityFilterFromDom);
-  reset.addEventListener("click", () => {
-    state.citySelected = new Set();
-    updateCityFilterUi();
-    refreshTable();
-  });
+function setupColumnFilters() {
+  for (const def of COLUMN_FILTERS) {
+    const trigger = document.querySelector(
+      `.col-filter-trigger[data-col-filter="${def.id}"]`
+    );
+    const panel = document.querySelector(
+      `.col-filter-panel[data-col-filter-panel="${def.id}"]`
+    );
+    const list = document.querySelector(
+      `.col-filter-list[data-col-filter-list="${def.id}"]`
+    );
+    const reset = document.querySelector(
+      `.col-filter-reset[data-col-filter-reset="${def.id}"]`
+    );
+    if (!trigger || !panel || !list || !reset) continue;
+
+    trigger.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (trigger.disabled) return;
+      const opening = panel.hidden;
+      setColumnFilterOpen(def.id, opening);
+    });
+    panel.addEventListener("click", (e) => e.stopPropagation());
+    // Prevent text-selection drags; toggle explicitly so label clicks always apply.
+    list.addEventListener("mousedown", (e) => {
+      if (e.target.closest("label")) e.preventDefault();
+    });
+    list.addEventListener("click", (e) => {
+      const label = e.target.closest("label");
+      if (!label || !list.contains(label)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const input = label.querySelector('input[type="checkbox"]');
+      if (!input) return;
+      input.checked = !input.checked;
+      syncColumnFilterFromDom(def.id);
+    });
+    reset.addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.columnFilters[def.id] = new Set();
+      requestAnimationFrame(() => refreshTable());
+    });
+  }
   window.addEventListener("resize", () => {
-    if (!panel.hidden) positionCityFilterPanel();
+    if (state.openColumnFilter) positionColumnFilterPanel(state.openColumnFilter);
   });
-  updateCityFilterUi();
+  updateColumnFilterUi();
 }
 
 function updateDowUi() {
@@ -714,15 +869,77 @@ function syncDowFromDom() {
     [...$("dowDays").querySelectorAll("input[type=checkbox]:checked")].map((el) => Number(el.value))
   );
   updateDowUi();
-  writeParams(formValues());
   refreshTable();
+}
+
+function rateTypeLabel(value) {
+  return value === "tm" ? "Team Member" : "Friends & Family";
+}
+
+function updateRateTypeUi() {
+  const trigger = $("rateTypeTrigger");
+  const meta = $("rateTypeMeta");
+  const hidden = $("rateType");
+  if (!trigger || !meta || !hidden) return;
+  const value = hidden.value === "tm" ? "tm" : "fnf";
+  hidden.value = value;
+  meta.textContent = rateTypeLabel(value);
+  trigger.classList.toggle("has-filter", value !== "fnf");
+  $("rateTypeOptions")
+    ?.querySelectorAll("input[type=radio]")
+    .forEach((input) => {
+      input.checked = input.value === value;
+    });
+}
+
+function setRateTypeOpen(open) {
+  const panel = $("rateTypePanel");
+  const trigger = $("rateTypeTrigger");
+  if (!panel || !trigger) return;
+  panel.hidden = !open;
+  trigger.setAttribute("aria-expanded", open ? "true" : "false");
+  const chevron = trigger.querySelector(".dow-chevron");
+  if (chevron) chevron.textContent = open ? "▴" : "▾";
+  if (open) {
+    setDowOpen(false);
+    closeAllColumnFilters();
+  }
+}
+
+function setupRateTypeFilter() {
+  updateRateTypeUi();
+  $("rateTypeTrigger")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setRateTypeOpen($("rateTypePanel").hidden);
+  });
+  $("rateTypePanel")?.addEventListener("click", (e) => e.stopPropagation());
+  $("rateTypeOptions")?.addEventListener("mousedown", (e) => {
+    if (e.target.closest("label")) e.preventDefault();
+  });
+  $("rateTypeOptions")?.addEventListener("click", (e) => {
+    const label = e.target.closest("label");
+    const options = $("rateTypeOptions");
+    if (!label || !options?.contains(label)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const input = label.querySelector('input[type="radio"]');
+    if (!input) return;
+    input.checked = true;
+    $("rateType").value = input.value === "tm" ? "tm" : "fnf";
+    updateRateTypeUi();
+    writeParams(formValues());
+    setRateTypeOpen(false);
+  });
 }
 
 function setDowOpen(open) {
   $("dowPanel").hidden = !open;
   $("dowTrigger").setAttribute("aria-expanded", open ? "true" : "false");
   $("dowTrigger").querySelector(".dow-chevron").textContent = open ? "▴" : "▾";
-  if (open) setCityFilterOpen(false);
+  if (open) {
+    setRateTypeOpen(false);
+    closeAllColumnFilters();
+  }
 }
 
 function setupDowFilter() {
@@ -732,16 +949,34 @@ function setupDowFilter() {
     setDowOpen($("dowPanel").hidden);
   });
   $("dowPanel").addEventListener("click", (e) => e.stopPropagation());
-  $("dowDays").addEventListener("change", syncDowFromDom);
-  $("dowReset").addEventListener("click", () => {
+  $("dowDays").addEventListener("mousedown", (e) => {
+    if (e.target.closest("label")) e.preventDefault();
+  });
+  $("dowDays").addEventListener("click", (e) => {
+    const label = e.target.closest("label");
+    if (!label || !$("dowDays").contains(label)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const input = label.querySelector('input[type="checkbox"]');
+    if (!input) return;
+    input.checked = !input.checked;
+    syncDowFromDom();
+  });
+  $("dowReset").addEventListener("click", (e) => {
+    e.stopPropagation();
     state.dowSelected = new Set();
     updateDowUi();
-    writeParams(formValues());
     refreshTable();
   });
   document.addEventListener("click", () => {
     setDowOpen(false);
-    setCityFilterOpen(false);
+    setRateTypeOpen(false);
+    closeAllColumnFilters();
+  });
+  document.addEventListener("goplus:close-overlays", () => {
+    setDowOpen(false);
+    setRateTypeOpen(false);
+    closeAllColumnFilters();
   });
 }
 
@@ -790,12 +1025,29 @@ function migrateRowKeyState(oldKey, newKey) {
   }
 }
 
+function formatCacheCapturedAt(fetchedAt) {
+  const ts = Number(fetchedAt);
+  if (!Number.isFinite(ts) || ts <= 0) return null;
+  const when = new Date(ts);
+  if (Number.isNaN(when.getTime())) return null;
+  return when.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 function cacheIconHtml(row, key) {
   if (!row.fromCache && !state.refreshingKeys.has(key)) return "";
   const refreshing = state.refreshingKeys.has(key);
+  const captured = formatCacheCapturedAt(row.fetchedAt);
   const title = refreshing
     ? "Refreshing…"
-    : "Cached (less than 24 hours old) — click to refresh";
+    : captured
+      ? `Cached · captured ${captured} — click to refresh`
+      : "Cached (less than 24 hours old) — click to refresh";
   return `<button
     type="button"
     class="cache-icon${refreshing ? " refreshing" : ""}"
@@ -822,6 +1074,11 @@ async function refreshCachedEntry(key) {
   refreshTable();
 
   const values = formValues();
+  const realName =
+    row.hotelName &&
+    String(row.hotelName).toUpperCase() !== String(row.ctyhocn).toUpperCase()
+      ? row.hotelName
+      : null;
   const res = await sendMessage({
     type: "REFRESH_RATE_ENTRY",
     ctyhocn: row.ctyhocn,
@@ -829,7 +1086,7 @@ async function refreshCachedEntry(key) {
     departureDate: row.departureDate,
     nights: stayNightsFor(row),
     friendsAndFamily: values.rateType !== "tm",
-    hotelName: row.hotelName,
+    hotelName: realName,
     brandCode: row.brandCode,
     city: row.city,
     country: row.country,
@@ -879,7 +1136,15 @@ async function refreshCachedEntry(key) {
     if ((fresh.roomsAvail ?? 0) < Number(values.minRooms || 1)) continue;
 
     const oldKey = rowKey(existing);
-    const merged = { ...existing, ...fresh, fromCache: false };
+    const merged = {
+      ...existing,
+      ...fresh,
+      hotelName: fresh.hotelName || existing.hotelName,
+      brandCode: fresh.brandCode || existing.brandCode,
+      city: fresh.city || existing.city,
+      country: fresh.country || existing.country,
+      fromCache: false,
+    };
     const newKey = rowKey(merged);
     migrateRowKeyState(oldKey, newKey);
     nextRows.push(merged);
@@ -916,6 +1181,18 @@ function weekdayLabel(isoDate) {
 }
 
 function detailItems(row, compareWith = null) {
+  if (row.inventoryOnly) {
+    return [
+      ["Hotel code", row.ctyhocn || "—"],
+      ["Brand", row.brandCode || "—"],
+      ["City", row.city || "—"],
+      ["Country", row.country || "—"],
+      ["Lead nightly", formatMoneyAmount(row.amount, row.currency, row.amountFmt)],
+      ["Rate", row.ratePlanName || "—"],
+      ["Rate code", row.ratePlanCode || "—"],
+      ["Source", "Country inventory (lead rate)"],
+    ];
+  }
   const nights = stayNightsFor(row);
   const stayEst = formatStayEstimate(row.amount, row.currency, nights);
   const saved =
@@ -996,14 +1273,22 @@ function roomsSectionHeading(key, label, { toggleable = false, open = true } = {
 
 function roomsSectionHtml(key, row) {
   const detail = state.roomDetails.get(key);
-  if (!detail || detail.status === "loading") {
-    return `<div class="rooms-section">${roomsSectionHeading(
+  const stay = stayDatesForRoomFetch(row);
+  const inventoryNote = row.inventoryOnly
+    ? `<div class="inventory-rooms-note">${escapeHtml(COUNTRY_ROOMS_HINT)}</div>`
+    : "";
+  if (!detail || detail.status === "loading" || detail.status === "queued") {
+    return `<div class="rooms-section">${inventoryNote}${roomsSectionHeading(
       key,
       "Available rooms"
-    )}<div class="rooms-status">Loading room rates for this stay…</div></div>`;
+    )}<div class="rooms-status">${
+      row.inventoryOnly
+        ? "Loading room rates for this hotel…"
+        : "Loading room rates for this stay…"
+    }</div></div>`;
   }
   if (detail.status === "error") {
-    return `<div class="rooms-section">${roomsSectionHeading(
+    return `<div class="rooms-section">${inventoryNote}${roomsSectionHeading(
       key,
       "Available rooms"
     )}<div class="rooms-status bad">${escapeHtml(
@@ -1012,27 +1297,29 @@ function roomsSectionHtml(key, row) {
   }
   const rooms = detail.rooms || [];
   if (!rooms.length) {
-    return `<div class="rooms-section">${roomsSectionHeading(
+    return `<div class="rooms-section">${inventoryNote}${roomsSectionHeading(
       key,
       "Available rooms"
     )}<div class="rooms-status">No room rates returned for this stay.</div></div>`;
   }
   const cacheNote = detail.fromCache ? ` · cached` : "";
   const open = isRoomsSectionOpen(key);
+  const arrivalDate = stay?.arrivalDate || row.arrivalDate;
+  const departureDate = stay?.departureDate || row.departureDate;
   const bookUrl = `https://www.hilton.com/en/book/reservation/rooms/?ctyhocn=${encodeURIComponent(
     row.ctyhocn
-  )}&arrivalDate=${encodeURIComponent(row.arrivalDate)}&departureDate=${encodeURIComponent(
-    row.departureDate
+  )}&arrivalDate=${encodeURIComponent(arrivalDate || "")}&departureDate=${encodeURIComponent(
+    departureDate || ""
   )}&room1NumAdults=1`;
   const groups = sortedRoomGroups(rooms);
   const title = `Available rooms (${rooms.length} prices · ${groups.length} types${cacheNote})`;
   if (!open) {
-    return `<div class="rooms-section collapsed">${roomsSectionHeading(key, title, {
+    return `<div class="rooms-section collapsed">${inventoryNote}${roomsSectionHeading(key, title, {
       toggleable: true,
       open: false,
     })}</div>`;
   }
-  const nights = stayNightsFor(row);
+  const nights = stay?.nights ?? stayNightsFor(row);
   const currency = row.currency || detail.currency;
   const rowsHtml = groups
     .map((group) => {
@@ -1137,7 +1424,9 @@ function roomsSectionHtml(key, row) {
 }
 
 async function loadRoomRates(key, row) {
-  if (!row?.ctyhocn || !row.arrivalDate || !row.departureDate) return;
+  if (!row?.ctyhocn) return;
+  const stay = stayDatesForRoomFetch(row);
+  if (!stay) return;
   const existing = state.roomDetails.get(key);
   if (existing?.status === "loading" || existing?.status === "ok") return;
 
@@ -1149,8 +1438,8 @@ async function loadRoomRates(key, row) {
   const res = await sendMessage({
     type: "FETCH_ROOM_RATES",
     ctyhocn: row.ctyhocn,
-    arrivalDate: row.arrivalDate,
-    departureDate: row.departureDate,
+    arrivalDate: stay.arrivalDate,
+    departureDate: stay.departureDate,
     friendsAndFamily: values.rateType !== "tm",
   });
 
@@ -1213,7 +1502,8 @@ function pumpRoomFetches() {
     state.roomFetchInFlight += 1;
     Promise.resolve()
       .then(() => loadRoomRates(key, row))
-      .finally(() => {
+      .finally(async () => {
+        await new Promise((r) => setTimeout(r, ROOM_FETCH_DELAY_MS));
         state.roomFetchInFlight = Math.max(0, state.roomFetchInFlight - 1);
         pumpRoomFetches();
       });
@@ -1224,11 +1514,191 @@ function pumpRoomFetches() {
 function prefetchRoomRatesForRows(rows) {
   const list = Array.isArray(rows) ? rows : [];
   for (const row of list) {
-    if (!row || row.error) continue;
+    if (!row || row.error || row.inventoryOnly) continue;
+    if (!row.arrivalDate || !row.departureDate) continue;
     const key = rowKey(row);
     enqueueRoomRateFetch(key, row, { priority: isFamilyAndFriendsRate(row) });
   }
 }
+
+function inventoryRowsFromHotels(hotels) {
+  return (hotels || [])
+    .filter((h) => h?.ctyhocn)
+    .map((h) => {
+      const ctyhocn = String(h.ctyhocn).toUpperCase();
+      return {
+        ctyhocn,
+        hotelName: h.name || ctyhocn,
+        brandCode: h.brandCode || null,
+        city: h.city || null,
+        country: h.country || null,
+        amount: h.amount ?? null,
+        amountFmt: h.amountFmt || null,
+        currency: h.currency || (h.amount != null ? "USD" : null),
+        ratePlanCode: h.ratePlanCode || null,
+        ratePlanName: h.ratePlanName || null,
+        specialRateType: h.amount != null ? "lead" : null,
+        isGoRate: false,
+        roomsAvail: null,
+        arrivalDate: null,
+        departureDate: null,
+        nights: null,
+        inventoryOnly: true,
+        bookUrl: `https://www.hilton.com/en/book/reservation/rooms/?ctyhocn=${encodeURIComponent(
+          ctyhocn
+        )}`,
+      };
+    });
+}
+
+/** Hilton prices its results page 20 hotels at a time — mirror that batch size. */
+const INVENTORY_RATE_PAGE_SIZE = 20;
+
+function applyInventoryRates(rates, { arrivalDate, departureDate, nights }) {
+  const byCtyhocn = new Map();
+  for (const rate of rates || []) {
+    if (rate?.ctyhocn) byCtyhocn.set(String(rate.ctyhocn).toUpperCase(), rate);
+  }
+  if (!byCtyhocn.size) return 0;
+
+  let updated = 0;
+  for (const row of state.allRows) {
+    const rate = byCtyhocn.get(String(row.ctyhocn || "").toUpperCase());
+    if (!rate) continue;
+    const oldKey = rowKey(row);
+    row.stayPriced = true;
+    row.arrivalDate = arrivalDate;
+    row.departureDate = departureDate;
+    row.nights = nights;
+    row.soldOut = Boolean(rate.soldOut);
+    if (rate.amount != null) {
+      row.amount = rate.amount;
+      row.amountFmt = rate.amountFmt;
+      row.currency = rate.currency || "USD";
+      row.amountAfterTax = rate.amountAfterTax ?? null;
+      row.ratePlanCode = rate.ratePlanCode;
+      row.ratePlanName = rate.ratePlanName;
+      row.specialRateType = rate.specialRateType;
+      row.isGoRate = Boolean(rate.isGoRate);
+    } else {
+      row.amount = null;
+      row.amountFmt = null;
+      row.specialRateType = rate.soldOut ? "sold out" : row.specialRateType;
+    }
+    row.bookUrl = `https://www.hilton.com/en/book/reservation/rooms/?ctyhocn=${encodeURIComponent(
+      row.ctyhocn
+    )}&arrivalDate=${encodeURIComponent(arrivalDate)}&departureDate=${encodeURIComponent(
+      departureDate
+    )}`;
+    migrateRowKeyState(oldKey, rowKey(row));
+    updated += 1;
+  }
+  return updated;
+}
+
+/**
+ * Walk the inventory in pages of 20 and fill in Go rates for the stay, the same
+ * shopMultiPropAvail pagination the Go Hilton results page uses.
+ */
+async function populateInventoryRates(placeLabel) {
+  const values = formValues();
+  const arrivalDate = values.fromDate;
+  if (!arrivalDate) return;
+  const nights = Math.max(1, Number(values.nights) || 1);
+  const departureDate = addDaysISO(arrivalDate, nights);
+  const friendsAndFamily = values.rateType !== "tm";
+
+  const codes = [
+    ...new Set(state.allRows.map((r) => String(r.ctyhocn || "").toUpperCase()).filter(Boolean)),
+  ];
+  const total = codes.length;
+  if (!total) return;
+
+  let done = 0;
+  let priced = 0;
+  let failed = 0;
+  for (let i = 0; i < total; i += INVENTORY_RATE_PAGE_SIZE) {
+    if (state.stopRequested) {
+      setStatus(`Stopped. ${priced} of ${total} hotels priced in ${placeLabel}.`, "warn");
+      return;
+    }
+    const page = codes.slice(i, i + INVENTORY_RATE_PAGE_SIZE);
+    const res = await sendMessage({
+      type: "FETCH_INVENTORY_RATES",
+      ctyhocns: page,
+      arrivalDate,
+      departureDate,
+      numAdults: 1,
+      numRooms: Math.max(1, Number(values.minRooms) || 1),
+      friendsAndFamily,
+    });
+    if (res?.cancelled || state.stopRequested) {
+      setStatus(`Stopped. ${priced} of ${total} hotels priced in ${placeLabel}.`, "warn");
+      return;
+    }
+    if (res?.unauthorized) {
+      markUnauthorized(res.error);
+      return;
+    }
+    if (res?.ok) {
+      priced += applyInventoryRates(res.rates, { arrivalDate, departureDate, nights });
+      refreshTable();
+    } else {
+      failed += page.length;
+    }
+    done += page.length;
+    setProgress((done / total) * 100);
+    setStatus(
+      `${placeLabel}: priced ${priced} of ${total} hotels for ${arrivalDate} → ${departureDate}…`
+    );
+  }
+
+  const failBit = failed ? ` · ${failed} hotel(s) failed to price` : "";
+  setProgress(100);
+  setStatus(
+    `Done. ${total} hotels in ${placeLabel} · ${priced} priced for ${nightsLabel(nights)} from ${arrivalDate}${failBit}. ${COUNTRY_ROOMS_HINT}`,
+    failed ? "warn" : ""
+  );
+}
+
+function isCountrySuggestionPick(picked) {
+  return (
+    picked?.type === "country" ||
+    /^dx-location::country::/i.test(String(picked?.placeId || ""))
+  );
+}
+
+function isLargeAreaSuggestionPick(picked) {
+  return (
+    isCountrySuggestionPick(picked) ||
+    picked?.type === "region" ||
+    (Boolean(picked?.state) && !picked?.city && !picked?.ctyhocn && !isCountrySuggestionPick(picked))
+  );
+}
+
+/** Dates for on-demand room shop (inventory rows use the form stay window). */
+function stayDatesForRoomFetch(row) {
+  if (row?.arrivalDate && row?.departureDate) {
+    return {
+      arrivalDate: row.arrivalDate,
+      departureDate: row.departureDate,
+      nights: stayNightsFor(row),
+    };
+  }
+  if (!row?.inventoryOnly) return null;
+  const values = formValues();
+  const arrivalDate = values.fromDate;
+  if (!arrivalDate) return null;
+  const nights = Math.max(1, Number(values.nights) || 1);
+  return {
+    arrivalDate,
+    departureDate: addDaysISO(arrivalDate, nights),
+    nights,
+  };
+}
+
+const COUNTRY_ROOMS_HINT =
+  "Country-wide search: ▾ Available rooms aren’t loaded until you open a hotel you’re interested in.";
 
 function toggleExpanded(key) {
   if (state.expanded.has(key)) {
@@ -1238,7 +1708,9 @@ function toggleExpanded(key) {
   }
   state.expanded.add(key);
   refreshTable();
-  const row = state.rows.find((r) => rowKey(r) === key) || state.allRows.find((r) => rowKey(r) === key);
+  const row =
+    state.rows.find((r) => rowKey(r) === key) ||
+    state.allRows.find((r) => rowKey(r) === key);
   if (row) enqueueRoomRateFetch(key, row, { priority: true });
 }
 
@@ -1263,7 +1735,9 @@ function summarizeScanErrors(errors) {
 function formatScanErrorStatus(errors) {
   const groups = summarizeScanErrors(errors);
   if (!groups.length) return "";
-  return groups.map((g) => `${g.count} failed: ${g.msg}`).join(" · ");
+  return groups
+    .map((g) => `${g.count} failed: ${String(g.msg || "").replace(/\.+$/, "")}`)
+    .join(" · ");
 }
 
 function scanErrorsHtml(errors) {
@@ -1281,8 +1755,24 @@ function scanErrorsHtml(errors) {
   return `<ul class="scan-errors">${items}</ul>`;
 }
 
+function uniqueHotelCount(rows) {
+  return new Set(
+    (rows || []).map((r) => String(r.ctyhocn || "").toUpperCase()).filter(Boolean)
+  ).size;
+}
+
+function resultsCountLabel(visibleRows, { totalRows = null, filtersActive = false } = {}) {
+  const stays = (visibleRows || []).length;
+  const hotels = uniqueHotelCount(visibleRows);
+  const staysBit =
+    filtersActive && totalRows != null && stays !== totalRows
+      ? `${stays} of ${totalRows} stays`
+      : `${stays} stay${stays === 1 ? "" : "s"}`;
+  return `${staysBit} • ${hotels} hotel${hotels === 1 ? "" : "s"}`;
+}
+
 function refreshTable() {
-  updateCityFilterUi();
+  updateColumnFilterUi();
   const filtered = filterResultRows(state.allRows);
   state.rows = sortedRows(filtered);
   const validKeys = new Set(state.rows.map(rowKey));
@@ -1292,8 +1782,7 @@ function refreshTable() {
   $("exportBtn").disabled = !state.rows.length;
   updateSortHeaders();
 
-  const filtersActive =
-    state.dowSelected.size > 0 || state.citySelected.size > 0;
+  const filtersActive = state.dowSelected.size > 0 || anyColumnFilterActive();
 
   if (!state.rows.length) {
     let emptyMsg = state.allRows.length
@@ -1306,18 +1795,22 @@ function refreshTable() {
     body.innerHTML = `<tr class="empty"><td colspan="8"><div class="empty-msg">${escapeHtml(
       emptyMsg
     )}</div>${scanErrorsHtml(state.scanErrors)}</td></tr>`;
-    $("resultsLabel").textContent = state.allRows.length
-      ? `0 shown · ${state.allRows.length} total`
-      : state.scanErrors.length
-        ? `0 results · ${state.scanErrors.length} failed`
-        : "0 results";
+    const emptyLabel = state.allRows.length
+      ? resultsCountLabel([], {
+          totalRows: state.allRows.length,
+          filtersActive: true,
+        })
+      : "0 stays • 0 hotels";
+    $("resultsLabel").textContent = state.scanErrors.length
+      ? `${emptyLabel} · ${state.scanErrors.length} failed`
+      : emptyLabel;
     return;
   }
 
-  const label =
-    filtersActive && state.rows.length !== state.allRows.length
-      ? `${state.rows.length} shown · ${state.allRows.length} total · ${new Set(state.rows.map((r) => r.ctyhocn)).size} hotels`
-      : `${state.rows.length} nights · ${new Set(state.rows.map((r) => r.ctyhocn)).size} hotels`;
+  const label = resultsCountLabel(state.rows, {
+    totalRows: state.allRows.length,
+    filtersActive,
+  });
   $("resultsLabel").textContent = state.scanErrors.length
     ? `${label} · ${state.scanErrors.length} failed`
     : label;
@@ -1325,14 +1818,21 @@ function refreshTable() {
     .map((row) => {
       const key = rowKey(row);
       const open = state.expanded.has(key);
-      const badge = row.isGoRate
-        ? `<span class="badge go">${escapeHtml(row.specialRateType || "go")}</span>`
-        : `<span class="badge">${escapeHtml(row.specialRateType || "other")}</span>`;
-      const cacheIcon = cacheIconHtml(row, key);
+      const badge = row.inventoryOnly && !row.stayPriced
+        ? `<span class="badge">lead</span>`
+        : row.isGoRate
+          ? `<span class="badge go">${escapeHtml(row.specialRateType || "go")}</span>`
+          : `<span class="badge">${escapeHtml(row.specialRateType || "other")}</span>`;
+      const cacheIcon = row.inventoryOnly ? "" : cacheIconHtml(row, key);
       const nights = stayNightsFor(row);
       const detail = state.roomDetails.get(key);
       let mainCompare = null;
-      if (isFamilyAndFriendsRate(row) && detail?.status === "ok" && detail.rooms?.length) {
+      if (
+        !row.inventoryOnly &&
+        isFamilyAndFriendsRate(row) &&
+        detail?.status === "ok" &&
+        detail.rooms?.length
+      ) {
         const sameType = row.roomTypeCode
           ? detail.rooms.filter(
               (r) =>
@@ -1351,15 +1851,20 @@ function refreshTable() {
             `<div class="detail-item"><dt>${escapeHtml(labelText)}</dt><dd>${escapeHtml(value)}</dd></div>`
         )
         .join("");
+      const dateLabel = row.arrivalDate || "—";
       return `<tr class="result-row${open ? " open" : ""}" data-row-key="${escapeHtml(key)}" tabindex="0" aria-expanded="${open ? "true" : "false"}">
-        <td class="date-cell">${cacheIcon}${escapeHtml(row.arrivalDate)}</td>
+        <td class="date-cell">${cacheIcon}${escapeHtml(dateLabel)}</td>
         <td>
           <div class="hotel-name">${escapeHtml(row.hotelName)}</div>
           <div class="hotel-code">${escapeHtml(row.ctyhocn)}</div>
         </td>
         <td>${escapeHtml(row.brandCode || "—")}</td>
         <td>${escapeHtml(row.city || "—")}</td>
-        <td class="rate">${rateDisplayHtml(row.amount, row.currency, row.amountFmt, nights, mainCompare)}</td>
+        <td class="rate">${
+          row.inventoryOnly && !row.stayPriced
+            ? rateDisplayHtml(row.amount, row.currency, row.amountFmt, null, null)
+            : rateDisplayHtml(row.amount, row.currency, row.amountFmt, nights, mainCompare)
+        }</td>
         <td>${escapeHtml(row.roomsAvail ?? "—")}</td>
         <td><div class="rate-plan-cell">${badge}<div class="hotel-code">${escapeHtml(row.ratePlanName || "")}</div></div></td>
         <td><a class="book-link" href="${escapeHtml(row.bookUrl)}" target="_blank" rel="noopener">Book</a></td>
@@ -1449,8 +1954,12 @@ function hideSuggestions() {
 function sectionTitle(type) {
   if (type === "hotel") return "Hotels";
   if (type === "airport") return "Airports";
-  if (type === "poi") return "Points of interest";
+  if (type === "poi") return "Places";
+  if (type === "country") return "Countries";
+  if (type === "region") return "States / regions";
+  if (type === "destination") return "Cities";
   if (type === "recent") return "Recent searches";
+  if (type === "cached") return "Local cache";
   return "Destinations";
 }
 
@@ -1506,10 +2015,7 @@ function searchFingerprint(entry) {
     entry.nights ?? "",
     entry.maxRate ?? "",
     entry.minRooms ?? "",
-    entry.maxHotels ?? "",
-    entry.goOnly ? "1" : "0",
     entry.rateType || "",
-    [...(entry.dowSelected || [])].sort((a, b) => a - b).join(","),
     sug?.ctyhocn || sug?.placeId || sug?.query || "",
   ].join("|");
 }
@@ -1526,10 +2032,7 @@ function snapshotFromForm() {
     nights: values.nights,
     maxRate: values.maxRate,
     minRooms: values.minRooms,
-    maxHotels: values.maxHotels,
-    goOnly: values.goOnly,
     rateType: values.rateType,
-    dowSelected: [...state.dowSelected],
     selectedSuggestion: sug
       ? {
           type: sug.type || null,
@@ -1549,7 +2052,9 @@ function snapshotFromForm() {
 
 async function rememberCurrentSearch() {
   const entry = snapshotFromForm();
-  if (!entry.destination || !entry.fromDate || !entry.toDate) return;
+  if (!entry.destination) return;
+  const cached = /^cached$/i.test(entry.destination) || entry.selectedSuggestion?.type === "cached";
+  if (!cached && (!entry.fromDate || !entry.toDate)) return;
   const fp = searchFingerprint(entry);
   const next = [entry, ...state.recentSearches.filter((r) => searchFingerprint(r) !== fp)];
   await persistRecentSearches(next);
@@ -1562,18 +2067,12 @@ async function removeRecentSearch(id) {
 function formatRecentMeta(entry) {
   const bits = [];
   if (entry.fromDate && entry.toDate) bits.push(`${entry.fromDate} → ${entry.toDate}`);
-  bits.push(nightsLabel(entry.nights));
+  else if (entry.fromDate) bits.push(`from ${entry.fromDate}`);
+  else if (entry.toDate) bits.push(`to ${entry.toDate}`);
+  if (entry.nights != null && entry.nights !== "") bits.push(nightsLabel(entry.nights));
+  else bits.push("any nights");
   if (entry.maxRate != null && entry.maxRate !== "") bits.push(`max ${entry.maxRate}`);
   bits.push(entry.rateType === "tm" ? "Team Member" : "F&F");
-  if (entry.goOnly) bits.push("Go only");
-  if (entry.dowSelected?.length) {
-    bits.push(
-      [...entry.dowSelected]
-        .sort((a, b) => (a === 0 ? 7 : a) - (b === 0 ? 7 : b))
-        .map((d) => DAY_NAMES[d])
-        .join(" ")
-    );
-  }
   return bits.join(" · ");
 }
 
@@ -1581,15 +2080,13 @@ function applySearchSnapshot(entry) {
   $("destination").value = entry.destination || "";
   $("fromDate").value = entry.fromDate || "";
   $("toDate").value = entry.toDate || "";
-  $("nights").value = String(entry.nights || 1);
+  refreshDatePickers();
+  $("nights").value = entry.nights == null || entry.nights === "" ? "" : String(entry.nights);
   $("maxRate").value = entry.maxRate == null || entry.maxRate === "" ? "" : String(entry.maxRate);
   $("minRooms").value = String(entry.minRooms || 1);
-  $("maxHotels").value = String(entry.maxHotels || 20);
-  $("goOnly").checked = entry.goOnly === true;
   $("rateType").value = entry.rateType || "fnf";
-  state.dowSelected = new Set(Array.isArray(entry.dowSelected) ? entry.dowSelected : []);
+  updateRateTypeUi();
   state.selectedSuggestion = entry.selectedSuggestion || null;
-  updateDowUi();
   writeParams(formValues());
 }
 
@@ -1612,21 +2109,58 @@ function filteredRecentSearches(query) {
   });
 }
 
+const CACHED_SUGGESTION = {
+  id: "goplus:cached",
+  type: "cached",
+  kind: "suggestion",
+  label: "Cached",
+  primary: "Cached",
+  secondary: "Search all cached rates",
+  query: "Cached",
+  placeId: null,
+  ctyhocn: null,
+};
+
+function isCachedSuggestion(item) {
+  return (
+    item?.type === "cached" ||
+    item?.id === "goplus:cached" ||
+    /^cached$/i.test(String(item?.query || item?.primary || ""))
+  );
+}
+
 function renderRecentSearches(query = "") {
   const panel = $("destinationSuggest");
   const input = $("destination");
+  const q = String(query || "").trim().toLowerCase();
+  const showCached = !q || "cached".startsWith(q) || q.includes("cach");
   const recents = filteredRecentSearches(query);
-  if (!recents.length) {
+  if (!showCached && !recents.length) {
     hideSuggestions();
     return;
   }
 
   const flat = [];
-  let html = `<div class="suggest-section"><div class="suggest-section-title">${sectionTitle("recent")}</div>`;
-  for (const entry of recents) {
+  let html = "";
+
+  if (showCached) {
+    html += `<div class="suggest-section"><div class="suggest-section-title">${sectionTitle(
+      "cached"
+    )}</div>`;
     const idx = flat.length;
-    flat.push({ kind: "recent", entry });
-    html += `<div class="recent-row">
+    flat.push({ ...CACHED_SUGGESTION });
+    html += `<button type="button" class="suggest-item" role="option" data-index="${idx}">
+      <span class="suggest-primary">${escapeHtml(CACHED_SUGGESTION.primary)}</span>
+      <span class="suggest-secondary">${escapeHtml(CACHED_SUGGESTION.secondary)}</span>
+    </button></div>`;
+  }
+
+  if (recents.length) {
+    html += `<div class="suggest-section"><div class="suggest-section-title">${sectionTitle("recent")}</div>`;
+    for (const entry of recents) {
+      const idx = flat.length;
+      flat.push({ kind: "recent", entry });
+      html += `<div class="recent-row">
       <button type="button" class="suggest-item recent-item" role="option" data-index="${idx}">
         <span class="suggest-primary">${escapeHtml(entry.destination)}</span>
         <span class="suggest-secondary">${escapeHtml(formatRecentMeta(entry))}</span>
@@ -1635,8 +2169,9 @@ function renderRecentSearches(query = "") {
         entry.id
       )}" aria-label="Remove recent search" title="Remove">×</button>
     </div>`;
+    }
+    html += `</div>`;
   }
-  html += `</div>`;
 
   state.suggestItems = flat;
   state.suggestIndex = -1;
@@ -1644,11 +2179,13 @@ function renderRecentSearches(query = "") {
   panel.hidden = false;
   input.setAttribute("aria-expanded", "true");
 
-  panel.querySelectorAll(".recent-item").forEach((btn) => {
+  panel.querySelectorAll(".suggest-item").forEach((btn) => {
     btn.addEventListener("mousedown", (e) => {
       e.preventDefault();
       const item = flat[Number(btn.dataset.index)];
-      if (item?.entry) selectRecentSearch(item.entry);
+      if (!item) return;
+      if (item.kind === "recent") selectRecentSearch(item.entry);
+      else selectSuggestion(item);
     });
   });
   panel.querySelectorAll(".recent-remove").forEach((btn) => {
@@ -1664,7 +2201,6 @@ function renderRecentSearches(query = "") {
 function selectRecentSearch(entry) {
   hideSuggestions();
   applySearchSnapshot(entry);
-  runSearch();
 }
 
 function renderSuggestions(suggestions) {
@@ -1679,30 +2215,17 @@ function renderSuggestions(suggestions) {
     return;
   }
 
-  const order = ["destination", "hotel", "airport", "poi"];
-  const groups = new Map();
-  for (const item of suggestions) {
-    const key = order.includes(item.type) ? item.type : "destination";
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(item);
-  }
-
-  const flat = [];
-  let html = "";
-  for (const type of order) {
-    const items = groups.get(type);
-    if (!items?.length) continue;
-    html += `<div class="suggest-section"><div class="suggest-section-title">${sectionTitle(type)}</div>`;
-    for (const item of items) {
-      const idx = flat.length;
-      flat.push({ kind: "suggestion", ...item });
-      html += `<button type="button" class="suggest-item" role="option" data-index="${idx}">
+  // Preserve Hilton autocomplete order (not regrouped).
+  const flat = suggestions.map((item) => ({ kind: "suggestion", ...item }));
+  const html = flat
+    .map((item, idx) => {
+      const meta = item.secondary || sectionTitle(item.type);
+      return `<button type="button" class="suggest-item" role="option" data-index="${idx}">
         <span class="suggest-primary">${escapeHtml(item.primary)}</span>
-        <span class="suggest-secondary">${escapeHtml(item.secondary || "")}</span>
+        <span class="suggest-secondary">${escapeHtml(meta)}</span>
       </button>`;
-    }
-    html += `</div>`;
-  }
+    })
+    .join("");
 
   state.suggestItems = flat;
   state.suggestIndex = -1;
@@ -1742,19 +2265,34 @@ function pickBestDestinationSuggestion(suggestions, query) {
   const list = Array.isArray(suggestions) ? suggestions : [];
   if (!list.length) return null;
   const q = String(query || "").trim().toLowerCase();
+  if (/^cached$/i.test(q)) {
+    return list.find(isCachedSuggestion) || CACHED_SUGGESTION;
+  }
   const scored = list.map((s) => {
     const primary = String(s.primary || "").toLowerCase();
     const label = String(s.label || s.query || "").toLowerCase();
     const city = String(s.city || "").toLowerCase();
+    const isCountry =
+      s.type === "country" || /^dx-location::country::/i.test(String(s.placeId || ""));
+    const isRegion =
+      s.type === "region" ||
+      (Boolean(s.state) && !s.city && !s.ctyhocn && !isCountry);
     let score = 0;
-    if (primary === q || label === q || city === q) score += 120;
-    if (primary.startsWith(q) || city.startsWith(q)) score += 60;
+    if (isCachedSuggestion(s)) score -= 200;
+    if (primary === q || label === q) score += 120;
+    if (city === q) score += isCountry ? 0 : 40;
+    if (primary.startsWith(q) || (!isCountry && city.startsWith(q))) score += 60;
     if (label.includes(q)) score += 20;
-    if (s.type === "destination") score += 40;
+    if (isCountry) score += 90;
+    else if (s.type === "destination") score += 40;
+    else if (isRegion) score += 30;
     else if (s.type === "hotel") score += 25;
     else if (s.type === "airport") score += 10;
     else if (s.type === "poi") score += 8;
-    else if (s.type === "region") score -= 50;
+    if (s.placeId) score += 15;
+    if (!isCountry && city === q && String(s.countryCode || "").toUpperCase() === "US") {
+      score -= 100;
+    }
     return { s, score };
   });
   scored.sort((a, b) => b.score - a.score);
@@ -1766,7 +2304,7 @@ async function fetchSuggestions(query) {
   const res = await sendMessage({
     type: "AUTOCOMPLETE_DESTINATION",
     query,
-    limit: 8,
+    limit: 20,
   });
   if (reqId !== state.suggestReq) return;
   if (!res.ok) {
@@ -1860,12 +2398,22 @@ async function runSearch(event) {
   }
 
   const values = formValues();
-  if (!values.destination || !values.fromDate || !values.toDate) {
+  const cachedSearch =
+    isCachedSuggestion(state.selectedSuggestion) || /^cached$/i.test(values.destination);
+  if (!values.destination) {
+    setStatus("Destination is required.");
+    return;
+  }
+  if (!cachedSearch && (!values.fromDate || !values.toDate)) {
     setStatus("Destination and dates are required.");
     return;
   }
-  if (values.toDate < values.fromDate) {
+  if (values.fromDate && values.toDate && values.toDate < values.fromDate) {
     setStatus("“To” date must be on or after “From”.");
+    return;
+  }
+  if (!cachedSearch && (values.nights == null || values.nights < 1)) {
+    setStatus("Nights must be at least 1.");
     return;
   }
 
@@ -1879,7 +2427,9 @@ async function runSearch(event) {
   state.roomsSectionOpen.clear();
   state.roomDescOpen.clear();
   state.refreshingKeys.clear();
-  state.citySelected.clear();
+  clearColumnFilters();
+  state.dowSelected = new Set();
+  updateDowUi();
   setScanningUi(true);
   setProgress(0);
   hideSuggestions();
@@ -1902,7 +2452,7 @@ async function runSearch(event) {
       const ac = await sendMessage({
         type: "AUTOCOMPLETE_DESTINATION",
         query: values.destination,
-        limit: 8,
+        limit: 20,
       });
       if (state.stopRequested || ac.cancelled) {
         setStatus("Stopped.");
@@ -1917,6 +2467,18 @@ async function runSearch(event) {
       }
     }
 
+    if (
+      !picked &&
+      values.destination &&
+      !/^cached$/i.test(values.destination)
+    ) {
+      setStatus(
+        `Couldn’t resolve “${values.destination}” in Hilton. Pick a suggestion from the list.`,
+        "warn"
+      );
+      return;
+    }
+
     if (picked?.type === "hotel" && picked.ctyhocn) {
       hotels = [
         {
@@ -1929,14 +2491,61 @@ async function runSearch(event) {
         },
       ];
       setStatus(`Scanning ${picked.primary}…`);
+    } else if (isCachedSuggestion(picked) || /^cached$/i.test(values.destination)) {
+      const nightsBit =
+        values.nights == null ? "any length" : nightsLabel(values.nights);
+      const dateBit =
+        values.fromDate && values.toDate
+          ? `${values.fromDate} → ${values.toDate}`
+          : values.fromDate
+            ? `from ${values.fromDate}`
+            : values.toDate
+              ? `to ${values.toDate}`
+              : "any dates";
+      setStatus(`Searching cached ${nightsBit} stays (${dateBit})…`);
+      const scanRes = await sendMessage({
+        type: "SCAN_CACHED_RATES",
+        fromDate: values.fromDate || null,
+        toDate: values.toDate || null,
+        nights: values.nights,
+        friendsAndFamily: values.rateType !== "tm",
+        goOnly: values.goOnly,
+        maxRate: values.maxRate,
+        minRooms: values.minRooms,
+      });
+      if (state.stopRequested || scanRes.cancelled) {
+        renderRows(scanRes.rows || []);
+        setStatus(
+          `Stopped. ${(scanRes.rows || []).filter((r) => !r.error).length} cached matches so far.`
+        );
+        return;
+      }
+      if (!scanRes.ok) {
+        throw new Error(scanRes.error || "Cached search failed");
+      }
+      renderRows(scanRes.rows || []);
+      const matched = (scanRes.rows || []).filter((r) => !r.error).length;
+      const hotelsCached = scanRes.hotelsCached || 0;
+      setProgress(100);
+      setStatus(
+        matched
+          ? `Done. ${matched} cached rates across ${hotelsCached} hotel${hotelsCached === 1 ? "" : "s"} (local only).`
+          : hotelsCached
+            ? `No matching nights in ${hotelsCached} cached hotel calendar${hotelsCached === 1 ? "" : "s"}.`
+            : "No cached rates yet. Run a normal search first to populate the cache."
+      );
+      return;
     } else {
       const destination = picked?.query || values.destination;
-      setStatus(`Finding hotels near ${destination}…`);
+      setStatus(
+        isLargeAreaSuggestionPick(picked)
+          ? `Loading hotels for ${destination}… This can take a while for large regions.`
+          : `Finding hotels near ${destination}…`
+      );
       const hotelRes = await sendMessage({
         type: "SEARCH_DESTINATION_HOTELS",
         destination,
         suggestion: picked,
-        limit: values.maxHotels,
       });
       if (state.stopRequested || hotelRes.cancelled) {
         setStatus("Stopped.");
@@ -1954,8 +2563,9 @@ async function runSearch(event) {
         hotelRes.place?.displayName ||
         hotelRes.resolvedSuggestion?.label ||
         destination;
+
       setStatus(
-        `Found ${hotels.length} hotels near ${placeLabel}. Scanning calendars…`
+        `Found ${hotels.length} hotels for ${placeLabel}. Scanning calendars at a steady pace…`
       );
     }
 
@@ -1978,7 +2588,7 @@ async function runSearch(event) {
       goOnly: values.goOnly,
       maxRate: values.maxRate,
       minRooms: values.minRooms,
-      delayMs: 350,
+      delayMs: SCAN_DELAY_MS,
     });
     if (!scanRes.ok) {
       if (scanRes.unauthorized || scanErrorsAreUnauthorized(scanRes.rows)) {
@@ -1996,23 +2606,24 @@ async function runSearch(event) {
     }
 
     setSession(scanRes.guestId || null, { userName: scanRes.userName || state.userName || null });
-    const matched = (scanRes.rows || []).filter((r) => !r.error).length;
+    const matchedRows = (scanRes.rows || []).filter((r) => !r.error);
+    const matched = matchedRows.length;
+    const cachedMatched = matchedRows.filter((r) => r.fromCache).length;
     const failCount = state.scanErrors.length;
-    const cacheBit =
-      scanRes.cacheHits > 0 ? ` · ${scanRes.cacheHits} from cache` : "";
+    const cacheBit = cachedMatched > 0 ? ` · ${cachedMatched} from cache` : "";
     const failBit = failCount ? ` · ${formatScanErrorStatus(state.scanErrors)}` : "";
     if (scanRes.cancelled || state.stopRequested) {
       setProgress(scanRes.total ? (scanRes.done / scanRes.total) * 100 : 0);
-      setStatus(`Stopped. ${matched} matching nights so far${cacheBit}${failBit}.`, failCount ? "warn" : "");
+      setStatus(`Stopped. ${matched} matching hotels so far${cacheBit}${failBit}.`, failCount ? "warn" : "");
     } else if (failCount && !matched) {
       setProgress(100);
-      setStatus(`No matching nights. ${formatScanErrorStatus(state.scanErrors)}`, "warn");
+      setStatus(`No matching hotels. ${formatScanErrorStatus(state.scanErrors)}`, "warn");
     } else if (failCount) {
       setProgress(100);
-      setStatus(`Done. ${matched} matching nights${cacheBit}${failBit}.`, "warn");
+      setStatus(`Done. ${matched} matching hotels${cacheBit}${failBit}.`, "warn");
     } else {
       setProgress(100);
-      setStatus(`Done. ${matched} matching nights${cacheBit}.`);
+      setStatus(`Done. ${matched} matching hotels${cacheBit}.`);
     }
   } catch (err) {
     setStatus(String(err.message || err));
@@ -2031,33 +2642,38 @@ chrome.runtime?.onMessage?.addListener((message) => {
     return;
   }
   setProgress((message.done / message.total) * 100);
-  const cacheBit = message.fromCache
-    ? " · cached"
-    : message.cacheHits
-      ? ` · ${message.cacheHits} cached`
-      : "";
-  const matchBit =
-    message.matches != null ? ` · ${message.matches} nights found` : "";
+  const matchedRows = Array.isArray(message.rows) ? message.rows.filter((r) => !r.error) : [];
+  const cachedMatched = matchedRows.filter((r) => r.fromCache).length;
+  const cacheBit = cachedMatched > 0 ? ` · ${cachedMatched} from cache` : "";
+  const matchBit = matchedRows.length ? ` · ${matchedRows.length} hotels found` : "";
   setStatus(`Scanning ${message.hotel}… (${message.done}/${message.total})${matchBit}${cacheBit}`);
   if (Array.isArray(message.rows)) {
     renderRows(message.rows);
   }
 });
 
+function setupClearableDateFields() {
+  // Dates use the custom calendar picker; clearing is via the panel "Clear" control.
+  setupDatePickers(["fromDate", "toDate"]);
+}
+
 async function boot() {
   const params = readParams();
-  const start = params.fromDate || todayISO();
-  const end = params.toDate || addDaysISO(start, 1);
-  $("destination").value = params.destination;
+  const start = todayISO();
+  const end = addDaysISO(start, 1);
+  setupClearableDateFields();
+  $("destination").value = "";
+  state.selectedSuggestion = null;
   $("fromDate").value = start;
   $("toDate").value = end;
+  refreshDatePickers();
   $("nights").value = String(params.nights || 1);
   $("maxRate").value = params.maxRate;
   $("minRooms").value = String(params.minRooms || 1);
-  $("maxHotels").value = String(params.maxHotels || 20);
-  $("goOnly").checked = params.goOnly;
-  $("rateType").value = params.rateType || "fnf";
-  state.dowSelected = params.dowSelected || new Set();
+  $("rateType").value = "fnf";
+  updateRateTypeUi();
+  state.dowSelected = new Set();
+  writeParams(formValues());
 
   await loadRecentSearches();
 
@@ -2130,7 +2746,8 @@ async function boot() {
   });
   updateSortHeaders();
   setupDowFilter();
-  setupCityFilter();
+  setupRateTypeFilter();
+  setupColumnFilters();
   setupDestinationAutocomplete();
   setupReauthHandling();
   setupMetricsSession();

@@ -50,6 +50,20 @@ async function getCachedCalendar(params) {
       req.onerror = () => reject(req.error);
     });
     if (!entry?.calendar) return null;
+    if (!isCompleteCalendarEntry(entry)) {
+      // Drop incomplete identity so the next write can store a full record.
+      try {
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE, "readwrite");
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+          tx.objectStore(STORE).delete(key);
+        });
+      } catch {
+        /* ignore */
+      }
+      return null;
+    }
     const age = Date.now() - Number(entry.fetchedAt || 0);
     if (age > TTL_MS) return null;
     return {
@@ -67,13 +81,72 @@ async function setCachedCalendar(params, calendar) {
   const key = calendarCacheKey(params);
   const db = await openDb();
   try {
+    // Preserve hotel identity if a refresh/write omits it (older paths left these null).
+    let prev = null;
+    try {
+      prev = await new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE, "readonly");
+        const req = tx.objectStore(STORE).get(key);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+    } catch {
+      prev = null;
+    }
+
+    const ctyhocn = String(params.ctyhocn || "").toUpperCase();
+    const pickMeta = (next, fallback) => {
+      const n = next == null || next === "" ? null : String(next);
+      if (n && n.toUpperCase() !== ctyhocn) return n;
+      const f = fallback == null || fallback === "" ? null : String(fallback);
+      if (f && f.toUpperCase() !== ctyhocn) return f;
+      return n || f || null;
+    };
+
+    // If this key never stored a name, borrow identity from any other calendar for the same hotel.
+    let sibling = null;
+    if (!pickMeta(params.hotelName || calendar.hotelName, prev?.hotelName)) {
+      try {
+        const all = await new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE, "readonly");
+          const req = tx.objectStore(STORE).getAll();
+          req.onsuccess = () => resolve(req.result || []);
+          req.onerror = () => reject(req.error);
+        });
+        sibling =
+          all.find(
+            (e) =>
+              e &&
+              e.key !== key &&
+              String(e.ctyhocn || "").toUpperCase() === ctyhocn &&
+              e.hotelName &&
+              String(e.hotelName).toUpperCase() !== ctyhocn
+          ) || null;
+      } catch {
+        sibling = null;
+      }
+    }
+
     const record = {
       key,
-      ctyhocn: String(params.ctyhocn || "").toUpperCase(),
+      ctyhocn,
       arrivalDate: params.arrivalDate,
       nights: Number(params.nights || 1),
       friendsAndFamily: Boolean(params.friendsAndFamily),
       guestId: params.guestId || null,
+      hotelName: pickMeta(
+        params.hotelName || calendar.hotelName,
+        prev?.hotelName || sibling?.hotelName
+      ),
+      brandCode: pickMeta(
+        params.brandCode || calendar.brandCode,
+        prev?.brandCode || sibling?.brandCode
+      ),
+      city: pickMeta(params.city || calendar.city, prev?.city || sibling?.city),
+      country: pickMeta(
+        params.country || calendar.country,
+        prev?.country || sibling?.country
+      ),
       fetchedAt: Date.now(),
       calendar: {
         ctyhocn: calendar.ctyhocn,
@@ -86,11 +159,33 @@ async function setCachedCalendar(params, calendar) {
       const tx = db.transaction(STORE, "readwrite");
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
-      tx.objectStore(STORE).put(record);
+      const store = tx.objectStore(STORE);
+      // Don't persist incomplete identity — Cached would show the CTYHOCN as the name.
+      if (!isCompleteCalendarEntry(record)) {
+        store.delete(key);
+      } else {
+        store.put(record);
+      }
     });
   } finally {
     db.close();
   }
+}
+
+function hasRealHotelName(entry) {
+  const code = String(entry?.ctyhocn || entry?.calendar?.ctyhocn || "").toUpperCase();
+  const name = entry?.hotelName == null || entry.hotelName === "" ? "" : String(entry.hotelName);
+  if (!name) return false;
+  if (code && name.toUpperCase() === code) return false;
+  return true;
+}
+
+/** Calendar rows need hotel identity; without it Cached falls back to the CTYHOCN. */
+function isCompleteCalendarEntry(entry) {
+  if (!entry?.calendar) return false;
+  if (!Array.isArray(entry.calendar.days)) return false;
+  if (!hasRealHotelName(entry)) return false;
+  return true;
 }
 
 async function pruneStaleCache() {
@@ -99,18 +194,28 @@ async function pruneStaleCache() {
   try {
     await new Promise((resolve, reject) => {
       const tx = db.transaction([STORE, ROOM_STORE], "readwrite");
-      for (const name of [STORE, ROOM_STORE]) {
-        const store = tx.objectStore(name);
-        const index = store.index("fetchedAt");
-        const range = IDBKeyRange.upperBound(cutoff);
-        const req = index.openCursor(range);
-        req.onsuccess = () => {
-          const cursor = req.result;
-          if (!cursor) return;
-          cursor.delete();
-          cursor.continue();
-        };
-      }
+
+      const calendars = tx.objectStore(STORE);
+      const calReq = calendars.openCursor();
+      calReq.onsuccess = () => {
+        const cursor = calReq.result;
+        if (!cursor) return;
+        const entry = cursor.value;
+        const stale = Number(entry?.fetchedAt || 0) <= cutoff;
+        if (stale || !isCompleteCalendarEntry(entry)) cursor.delete();
+        cursor.continue();
+      };
+
+      const rooms = tx.objectStore(ROOM_STORE);
+      const roomIndex = rooms.index("fetchedAt");
+      const roomReq = roomIndex.openCursor(IDBKeyRange.upperBound(cutoff));
+      roomReq.onsuccess = () => {
+        const cursor = roomReq.result;
+        if (!cursor) return;
+        cursor.delete();
+        cursor.continue();
+      };
+
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
@@ -180,6 +285,45 @@ async function setCachedShopRooms(params, payload) {
   }
 }
 
+/**
+ * All non-stale calendar cache entries matching nights / rate type / guest.
+ * Used by the "Cached" destination to search local results only.
+ */
+async function listCachedCalendars({
+  nights = null,
+  friendsAndFamily = null,
+  guestId = null,
+  includeStale = false,
+} = {}) {
+  const db = await openDb();
+  try {
+    const entries = await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, "readonly");
+      const req = tx.objectStore(STORE).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+    const now = Date.now();
+    const wantNights = nights == null ? null : Number(nights) || 1;
+    const wantGuest = guestId == null ? null : guestId ? String(guestId) : "0";
+    return entries.filter((entry) => {
+      if (!isCompleteCalendarEntry(entry)) return false;
+      if (!includeStale && now - Number(entry.fetchedAt || 0) > TTL_MS) return false;
+      if (wantNights != null && Number(entry.nights || 1) !== wantNights) return false;
+      if (friendsAndFamily != null && Boolean(entry.friendsAndFamily) !== Boolean(friendsAndFamily)) {
+        return false;
+      }
+      if (wantGuest != null) {
+        const entryGuest = entry.guestId ? String(entry.guestId) : "0";
+        if (entryGuest !== wantGuest) return false;
+      }
+      return true;
+    });
+  } finally {
+    db.close();
+  }
+}
+
 async function deleteCachedCalendar(params) {
   const key = calendarCacheKey(params);
   const db = await openDb();
@@ -214,6 +358,7 @@ export {
   getCachedCalendar,
   setCachedCalendar,
   deleteCachedCalendar,
+  listCachedCalendars,
   getCachedShopRooms,
   setCachedShopRooms,
   deleteCachedShopRooms,

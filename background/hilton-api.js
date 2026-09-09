@@ -95,50 +95,6 @@ const SHOP_AVAIL_QUERY = `query hotel_shopAvailOptions_shopAvailProp($arrivalDat
   }
 }`;
 
-const SHOP_AVAIL_QUERY_SIMPLE = `query hotel_shopAvailOptions_shopAvailProp($arrivalDate: String!, $departureDate: String!, $ctyhocn: String!, $language: String!, $guestLocationCountry: String, $numAdults: Int!, $numChildren: Int!, $numRooms: Int!, $displayCurrency: String, $guestId: BigInt, $specialRates: ShopSpecialRateInput, $childAges: [Int], $modifyingReservation: Boolean) {
-  hotel(ctyhocn: $ctyhocn, language: $language) {
-    ctyhocn
-    shopAvail(
-      input: {
-        guestLocationCountry: $guestLocationCountry
-        arrivalDate: $arrivalDate
-        departureDate: $departureDate
-        displayCurrency: $displayCurrency
-        numAdults: $numAdults
-        numChildren: $numChildren
-        numRooms: $numRooms
-        guestId: $guestId
-        specialRates: $specialRates
-        childAges: $childAges
-        modifyingReservation: $modifyingReservation
-      }
-    ) {
-      statusCode
-      currencyCode
-      roomTypes {
-        roomTypeCode
-        roomTypeName
-        roomTypeDesc
-        numBeds
-        smokingRoom
-        adaAccessibleRoom
-      }
-      roomRates {
-        numRoomsAvail
-        rateAmount(strategy: ceiling)
-        rateAmountFmt(decimal: 0, strategy: ceiling)
-        ratePlanCode
-        roomTypeCode
-        ratePlan {
-          ratePlanName
-          ratePlanDesc
-          specialRateType
-        }
-      }
-    }
-  }
-}`;
-
 const GUEST_USERNAME_QUERY = `query guest($guestId: BigInt!, $language: String!) {
   guest(guestId: $guestId, language: $language) {
     guestId
@@ -152,15 +108,49 @@ const GUEST_USERNAME_QUERY = `query guest($guestId: BigInt!, $language: String!)
   }
 }`;
 
+/** Go Hilton place resolve — same op as dx-go-hilton2-ui after autocomplete select. */
+const GO_HILTON_GEOCODE_QUERY = `query geocode($address: String, $language: String!, $placeId: String, $sessionToken: String) {
+  geocode(
+    language: $language
+    address: $address
+    placeId: $placeId
+    sessionToken: $sessionToken
+  ) {
+    match {
+      id
+      name
+      type
+      placeUri
+      address {
+        city
+        country
+        countryName
+        postalCode
+        state
+        stateName
+      }
+      geometry {
+        location {
+          latitude
+          longitude
+        }
+        bounds {
+          northeast { latitude longitude }
+          southwest { latitude longitude }
+        }
+      }
+    }
+  }
+}`;
+
 const GEOCODE_QUERY = `query hotelSummaryOptions_geocodePage(
   $language: String!,
   $path: String!,
-  $distanceUnit: HotelDistanceUnit,
   $input: HotelSummaryOptionsInput
 ) {
   geocodePage(language: $language, path: $path) {
     match { name type }
-    hotelSummaryOptions(distanceUnit: $distanceUnit, sortBy: distance, input: $input) {
+    hotelSummaryOptions(sortBy: distance, input: $input) {
       hotels {
         ctyhocn
         name
@@ -196,6 +186,78 @@ const HOTEL_SUMMARY_QUERY = `query hotelSummaryOptions($language: String!, $inpu
   }
 }`;
 
+/** Hilton country / locations inventory (geocodePage) with explicit page size. */
+const COUNTRY_GEOCODE_QUERY = `query hotelSummaryOptions_geocodePage(
+  $language: String!,
+  $path: String!,
+  $queryLimit: Int!,
+  $input: HotelSummaryOptionsInput
+) {
+  geocodePage(language: $language, path: $path) {
+    match { name type }
+    location {
+      pageInterlinks {
+        title
+        links { name uri }
+      }
+    }
+    hotelSummaryOptions(sortBy: distance, input: $input) {
+      hotels(first: $queryLimit) {
+        ctyhocn
+        name
+        brandCode
+        distance
+        distanceFmt
+        address { city country countryName state stateName }
+        localization {
+          currencyCode
+          coordinate { latitude longitude }
+        }
+        facilityOverview { homeUrlTemplate }
+        leadRate {
+          lowest {
+            rateAmount(currencyCode: "USD")
+            rateAmountFmt(decimal: 0, strategy: ceiling)
+            ratePlanCode
+            ratePlan {
+              ratePlanName
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+/** Go Hilton map search — viewport-scoped; keep for city quadrant merges. */
+const COUNTRY_INVENTORY_QUERY = `query hotelSummaryOptions($language: String!, $input: HotelSummaryOptionsInput, $queryLimit: Int!) {
+  hotelSummaryOptions(language: $language, input: $input) {
+    hotels(first: $queryLimit) {
+      ctyhocn
+      name
+      brandCode
+      distance
+      distanceFmt
+      address { city country countryName state stateName }
+      localization {
+        currencyCode
+        coordinate { latitude longitude }
+      }
+      facilityOverview { homeUrlTemplate }
+      leadRate {
+        lowest {
+          rateAmount(currencyCode: "USD")
+          rateAmountFmt(decimal: 0, strategy: ceiling)
+          ratePlanCode
+          ratePlan {
+            ratePlanName
+          }
+        }
+      }
+    }
+  }
+}`;
+
 const HOTEL_QUADRANTS_QUERY = `query hotelQuadrants {
   hotelQuadrants {
     id
@@ -203,7 +265,60 @@ const HOTEL_QUADRANTS_QUERY = `query hotelQuadrants {
       northeast { latitude longitude }
       southwest { latitude longitude }
     }
-    countries { code }
+    countries { code states }
+  }
+}`;
+
+/** One map tile of inventory — the call hilton.com repeats per quadrant on a search. */
+const QUADRANT_SUMMARY_QUERY = `query hotelSummaryOptions($language: String!, $input: HotelSummaryOptionsInput) {
+  hotelSummaryOptions(language: $language, input: $input) {
+    hotels {
+      ctyhocn
+      name
+      brandCode
+      distance
+      distanceFmt
+      address { city country countryName state stateName }
+      localization {
+        currencyCode
+        coordinate { latitude longitude }
+      }
+      facilityOverview { homeUrlTemplate }
+      leadRate {
+        lowest {
+          rateAmount(currencyCode: "USD")
+          rateAmountFmt(decimal: 0, strategy: ceiling)
+          ratePlanCode
+          ratePlan { ratePlanName }
+        }
+      }
+    }
+  }
+}`;
+
+/** Lead rates for up to 20 hotels at a time — how the results page fills each page. */
+const MULTI_PROP_AVAIL_QUERY = `query shopMultiPropAvail($ctyhocns: [String!], $language: String!, $input: ShopMultiPropAvailQueryInput!) {
+  shopMultiPropAvail(input: $input, language: $language, ctyhocns: $ctyhocns) {
+    ctyhocn
+    currencyCode
+    statusCode
+    statusMessage
+    lengthOfStay
+    summary {
+      lowest {
+        rateAmount(currencyCode: "USD")
+        rateAmountFmt(strategy: ceiling, decimal: 0)
+        ratePlanCode
+        ratePlan {
+          ratePlanName
+          specialRateType
+          confidentialRates
+        }
+        amountAfterTax(currencyCode: "USD")
+        amountAfterTaxFmt(decimal: 0, strategy: ceiling)
+      }
+      status { type }
+    }
   }
 }`;
 
@@ -810,21 +925,33 @@ async function hiltonMainWorldFetch(url, { method = "GET", headers = {}, body = 
   return result;
 }
 
-function isForbidden(result) {
+function isAkamaiForbidden(result) {
   if (!result) return true;
-  if (result.status === 403) return true;
   const t = result.text || "";
-  return /access denied|forbidden/i.test(t) || t === "Success";
+  if (t === "Success") return true;
+  if (/access denied/i.test(t)) return true;
+  // GraphQL JSON (including HTTP 403 + "Invalid operation name") is not Akamai —
+  // return it so callers can parse errors and retry with another client.
+  if (result.status === 403) {
+    try {
+      const json = JSON.parse(t);
+      if (json && (Array.isArray(json.errors) || json.data !== undefined)) return false;
+    } catch {
+      /* HTML / empty 403 */
+    }
+    return true;
+  }
+  return /forbidden/i.test(t) && !/"errors"\s*:/.test(t);
 }
 
 async function hiltonPageFetch(url, { method = "GET", headers = {}, body = null } = {}) {
   // 1) MAIN-world page fetch (correct browser Origin)
   let result = await hiltonMainWorldFetch(url, { method, headers, body });
-  if (!isForbidden(result)) return result;
+  if (!isAkamaiForbidden(result)) return result;
 
   // 2) SW fetch with DNR Origin rewrite + Bearer token
   result = await hiltonSwFetch(url, { method, headers, body });
-  if (!isForbidden(result)) return result;
+  if (!isAkamaiForbidden(result)) return result;
 
   return result;
 }
@@ -867,10 +994,107 @@ function textLooksUnauthorized(text) {
   );
 }
 
-async function hiltonGraphql(operationName, query, variables, appName = "dx_shop_search_app") {
+function hasGraphqlData(data) {
+  if (!data || typeof data !== "object") return false;
+  return Object.values(data).some((v) => v != null);
+}
+
+function defaultAppVersion(appName) {
+  if (appName === "dx-go-hilton2-ui") return "dx-go-hilton2-ui:1013426";
+  // Calendar + most shop calls historically use this build id even when
+  // appName is dx-res-ui (Hilton's own traffic does the same mismatch).
+  return "dx-shop-search-ui:1030775";
+}
+
+/** Read live Hilton DX appVersion strings from an open www.hilton.com tab. */
+async function discoverHiltonAppVersions() {
+  try {
+    const tabId = await ensureHiltonTab();
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        const found = new Set();
+        const re = /(?:dx-res-ui|dx-shop-search-ui|dx-go-hilton2-ui|dx-ohw-ui)[:/][0-9][0-9A-Za-z._-]*/g;
+        const bags = [];
+        try {
+          bags.push(...performance.getEntriesByType("resource").map((e) => e.name));
+        } catch {
+          /* ignore */
+        }
+        try {
+          for (const s of document.scripts) {
+            if (s.src) bags.push(s.src);
+          }
+        } catch {
+          /* ignore */
+        }
+        try {
+          bags.push(document.documentElement?.innerHTML?.slice(0, 400000) || "");
+        } catch {
+          /* ignore */
+        }
+        for (const bag of bags) {
+          if (!bag) continue;
+          re.lastIndex = 0;
+          let m;
+          while ((m = re.exec(bag))) {
+            found.add(String(m[0]).replace("/", ":"));
+          }
+        }
+        return [...found];
+      },
+    });
+    return Array.isArray(result) ? result : [];
+  } catch {
+    return [];
+  }
+}
+
+function shopAvailClientAttempts(discovered = []) {
+  const attempts = [];
+  const seen = new Set();
+  const push = (appName, appVersion) => {
+    if (!appName || !appVersion) return;
+    const key = `${appName}|${appVersion}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    attempts.push({ appName, appVersion });
+  };
+
+  for (const ver of discovered) {
+    if (ver.startsWith("dx-res-ui:")) push("dx-res-ui", ver);
+    if (ver.startsWith("dx-shop-search-ui:")) {
+      push("dx_shop_search_app", ver);
+      // Historical go+ combo that calendar still uses.
+      push("dx-res-ui", ver);
+    }
+    if (ver.startsWith("dx-go-hilton2-ui:")) push("dx-go-hilton2-ui", ver);
+  }
+
+  // Stable fallbacks (matched appName/appVersion prefixes first).
+  push("dx-res-ui", "dx-res-ui:1030775");
+  push("dx_shop_search_app", "dx-shop-search-ui:1030775");
+  push("dx-res-ui", "dx-shop-search-ui:1030775");
+  push("dx-go-hilton2-ui", "dx-go-hilton2-ui:1013426");
+  return attempts;
+}
+
+function isInvalidOperationNameError(errOrMessage) {
+  return /invalid operation name/i.test(String(errOrMessage?.message || errOrMessage || ""));
+}
+
+async function hiltonGraphql(
+  operationName,
+  query,
+  variables,
+  appName = "dx_shop_search_app",
+  { appVersion = null } = {}
+) {
+  const version = appVersion || defaultAppVersion(appName);
   const url = `https://www.hilton.com/graphql/customer?appName=${encodeURIComponent(
     appName
-  )}&appVersion=${encodeURIComponent("dx-shop-search-ui:1017874")}&operationName=${encodeURIComponent(
+  )}&appVersion=${encodeURIComponent(version)}&operationName=${encodeURIComponent(
     operationName
   )}&originalOpName=${encodeURIComponent(operationName)}&bl=en`;
 
@@ -883,11 +1107,6 @@ async function hiltonGraphql(operationName, query, variables, appName = "dx_shop
   if (!text || text === "Success") {
     throw new Error("Hilton blocked the request. Stay signed into Go Hilton in Chrome, then retry.");
   }
-  if (status === 403 || /access denied|forbidden/i.test(text)) {
-    throw new Error(
-      "Hilton returned 403. Open https://www.hilton.com/en/go-hilton/ signed-in in this Chrome profile, reload the extension, then retry."
-    );
-  }
 
   let json = null;
   try {
@@ -895,6 +1114,11 @@ async function hiltonGraphql(operationName, query, variables, appName = "dx_shop
   } catch {
     if (status === 401 || textLooksUnauthorized(text)) {
       throw new UnauthorizedError("Hilton session expired. Sign in again to continue.");
+    }
+    if (status === 403 || /access denied|forbidden/i.test(text)) {
+      throw new Error(
+        "Hilton returned 403. Open https://www.hilton.com/en/go-hilton/ signed-in in this Chrome profile, reload the extension, then retry."
+      );
     }
     throw new Error(`Hilton returned non-JSON (${status}).`);
   }
@@ -908,7 +1132,18 @@ async function hiltonGraphql(operationName, query, variables, appName = "dx_shop
     if (/unauthorized/i.test(message)) {
       throw new UnauthorizedError("Hilton session expired. Sign in again to continue.");
     }
-    throw new Error(message);
+    if (isInvalidOperationNameError(message)) {
+      throw new Error(`Invalid operation name (${appName} / ${version})`);
+    }
+    // Hilton returns field-level errors (nullable leadRate, partial regions) alongside
+    // usable data — only fail when nothing came back.
+    if (!hasGraphqlData(json.data)) {
+      throw new Error(message);
+    }
+  } else if (status === 403) {
+    throw new Error(
+      "Hilton returned 403. Open https://www.hilton.com/en/go-hilton/ signed-in in this Chrome profile, reload the extension, then retry."
+    );
   }
   return json;
 }
@@ -956,18 +1191,229 @@ function slugify(value) {
 }
 
 function countryPathName(country, countryCode) {
-  const map = {
-    US: "united-states",
-    GB: "united-kingdom",
-    AE: "united-arab-emirates",
-    KR: "south-korea",
+  return countryLocationPathCandidates(country, countryCode)[0] || "usa";
+}
+
+/** Hilton locations slugs — prefer autocomplete labels (USA → usa), then ISO overrides. */
+function countryLocationPathCandidates(country, countryCode) {
+  const code = String(countryCode || "").toUpperCase();
+  const nameSlug = slugify(country);
+  const byCode = {
+    US: ["usa"],
+    GB: ["united-kingdom"],
+    UK: ["united-kingdom"],
+    AE: ["united-arab-emirates"],
+    KR: ["south-korea"],
+    CZ: ["czech-republic", "czechia"],
+    RU: ["russia"],
+    NL: ["netherlands"],
   };
-  if (map[countryCode]) return map[countryCode];
-  return slugify(country) || "united-states";
+  const out = [];
+  const push = (slug) => {
+    if (!slug || out.includes(slug)) return;
+    out.push(slug);
+  };
+  // Autocomplete countryName is often the working slug ("USA", "Italy").
+  push(nameSlug);
+  for (const slug of byCode[code] || []) push(slug);
+  if (code === "US") push("usa");
+  return out;
+}
+
+function isGeocodeNotFoundError(err) {
+  return /not found/i.test(String(err?.message || err || ""));
+}
+
+async function hiltonGeocodePlace({ address = "", placeId = "" } = {}) {
+  const json = await hiltonGraphql(
+    "geocode",
+    GO_HILTON_GEOCODE_QUERY,
+    {
+      language: "en",
+      address: address || null,
+      placeId: placeId || "",
+      sessionToken: "",
+    },
+    "dx-go-hilton2-ui"
+  );
+  return json?.data?.geocode?.match || null;
+}
+
+/**
+ * Load hotels for a Hilton locations path the same way Go Hilton find-hotels does:
+ * `hotelSummaryOptions_geocodePage` with `queryLimit: 150` (no `after` cursor).
+ * When a page is capped at 150, expand child city/area interlinks.
+ */
+async function fetchAllHotelsForPlaceUri(placeUri, countryCode, { pageSize = 150 } = {}) {
+  const path = normalizeLocationPath(placeUri);
+  if (!path) return { hotels: [], interlinks: [] };
+
+  const first = Math.min(Math.max(Number(pageSize) || 150, 20), 150);
+  const result = await fetchGeocodePathInventory(path, countryCode, first);
+  const hotels = [];
+  const seen = new Set();
+  for (const h of result.hotels || []) {
+    if (!h?.ctyhocn || seen.has(h.ctyhocn)) continue;
+    seen.add(h.ctyhocn);
+    hotels.push(h);
+  }
+  const interlinks = result.interlinks || [];
+
+  // Dense regions hit Hilton’s 150 cap — walk child city/area pages.
+  const children = childLocationPaths(path, interlinks);
+  if (children.length && hotels.length >= first) {
+    const batches = await mapPool(children, 4, async (childPath) => {
+      try {
+        return (await fetchAllHotelsForPlaceUri(childPath, countryCode, { pageSize: first }))
+          .hotels;
+      } catch {
+        return [];
+      }
+    });
+    for (const list of batches) {
+      for (const h of list || []) {
+        if (!h?.ctyhocn || seen.has(h.ctyhocn)) continue;
+        seen.add(h.ctyhocn);
+        hotels.push(h);
+      }
+    }
+  }
+
+  return { hotels, interlinks };
+}
+
+function isCountryMatch(match, resolved, placeUri) {
+  if (isRegionSuggestion(resolved)) return false;
+  return (
+    isCountrySuggestion(resolved) ||
+    /country/i.test(String(match?.type || "")) ||
+    Boolean(placeUri && /^\/en\/locations\/[^/]+\/$/.test(placeUri))
+  );
+}
+
+/** State / province / island — not a country, not a city. */
+function isRegionMatch(match, resolved, placeUri) {
+  if (isCountrySuggestion(resolved) || isCountryMatch(match, resolved, placeUri)) return false;
+  if (isRegionSuggestion(resolved)) return true;
+  const t = String(match?.type || "").toLowerCase();
+  if (/(state|region|province|administrative)/i.test(t)) return true;
+  // /en/locations/{country}/{subdivision}/
+  if (placeUri && /^\/en\/locations\/[^/]+\/[^/]+\/$/.test(placeUri)) return true;
+  const hasState = Boolean(match?.address?.state || match?.address?.stateName || resolved?.state);
+  const hasCity = Boolean(match?.address?.city || resolved?.city);
+  return hasState && !hasCity;
+}
+
+/**
+ * Fetch every hotel for a Go Hilton geocode match.
+ * Primary path mirrors hilton.com: fan out over map quadrants (134 tiles for the USA).
+ * The /en/locations/ crawl stays as a fallback for places the tiles don't cover.
+ */
+async function fetchEntirePlaceInventory(match, resolved, countryCode) {
+  const placeUri = normalizeLocationPath(match?.placeUri);
+  const isCountry = isCountryMatch(match, resolved, placeUri);
+
+  let quadrantError = null;
+  try {
+    const tiles = await fetchInventoryByQuadrants(match, countryCode, { isCountry });
+    if (tiles.hotels.length) {
+      const source = tiles.failures
+        ? `quadrants:${tiles.quadrants}+fails:${tiles.failures}`
+        : `quadrants:${tiles.quadrants}`;
+      return { hotels: tiles.hotels, source, lastError: tiles.lastError, isCountry };
+    }
+    quadrantError = tiles.lastError;
+  } catch (err) {
+    if (isUnauthorizedError(err)) throw err;
+    quadrantError = err;
+  }
+
+  const pages = await fetchInventoryByLocationPages(match, resolved, countryCode);
+  return { ...pages, lastError: pages.lastError || quadrantError };
+}
+
+async function fetchInventoryByLocationPages(match, resolved, countryCode) {
+  const placeUri = normalizeLocationPath(match?.placeUri);
+  const seen = new Set();
+  const hotels = [];
+  const addHotels = (list) => {
+    for (const h of list || []) {
+      if (!h?.ctyhocn || seen.has(h.ctyhocn)) continue;
+      seen.add(h.ctyhocn);
+      hotels.push(h);
+    }
+  };
+
+  const isCountry = isCountryMatch(match, resolved, placeUri);
+
+  let interlinks = [];
+  let sourceParts = [];
+  let lastError = null;
+
+  // Country GraphQL geocodePage is Not Found for USA — skip straight to regions.
+  if (placeUri && !isCountry) {
+    try {
+      const page = await fetchAllHotelsForPlaceUri(placeUri, countryCode, { pageSize: 150 });
+      addHotels(page.hotels);
+      interlinks = page.interlinks || [];
+      sourceParts.push(`geocodePage:${placeUri}`);
+    } catch (err) {
+      lastError = err;
+      if (!isGeocodeNotFoundError(err)) throw err;
+    }
+  } else if (placeUri && isCountry) {
+    sourceParts.push(`skipCountryPage:${placeUri}`);
+  }
+
+  // Build subdivision list: interlinks from the place page + known US states for country.
+  let childPaths = childLocationPaths(placeUri, interlinks);
+  const slug =
+    (placeUri && placeUri.split("/").filter(Boolean).pop()) ||
+    countryLocationPathCandidates(match?.address?.countryName, countryCode)[0];
+  if (isCountry) {
+    for (const path of knownCountryRegionPaths(countryCode, slug)) {
+      if (!childPaths.includes(path)) childPaths.push(path);
+    }
+  }
+
+  const shouldWalkChildren =
+    childPaths.length > 0 &&
+    (isCountry || hotels.length === 0 || hotels.length >= 150);
+
+  let regionFailures = 0;
+  if (shouldWalkChildren) {
+    const batches = await mapPool(childPaths, 4, async (path) => {
+      try {
+        const child = await fetchAllHotelsForPlaceUri(path, countryCode, { pageSize: 150 });
+        return child.hotels || [];
+      } catch (err) {
+        regionFailures += 1;
+        if (!isGeocodeNotFoundError(err)) {
+          lastError = err;
+        }
+        return [];
+      }
+    });
+    for (const list of batches) addHotels(list);
+    sourceParts.push(`regions:${childPaths.length}`);
+    if (regionFailures) sourceParts.push(`regionFails:${regionFailures}`);
+  }
+
+  if (isCountry && !hotels.length && regionFailures > 0 && lastError) {
+    throw lastError;
+  }
+
+  return {
+    hotels,
+    source: sourceParts.join("+") || null,
+    lastError,
+    isCountry,
+  };
 }
 
 function normalizeHotel(h) {
   if (!h?.ctyhocn) return null;
+  const lowest = h.leadRate?.lowest;
   return {
     ctyhocn: String(h.ctyhocn).toUpperCase(),
     name: h.name || h.ctyhocn,
@@ -976,11 +1422,16 @@ function normalizeHotel(h) {
     distanceFmt: h.distanceFmt || null,
     city: h.address?.city || null,
     country: h.address?.countryName || h.address?.country || null,
+    countryCode: h.address?.country ? String(h.address.country).toUpperCase() : null,
     state: h.address?.stateName || h.address?.state || null,
     lat: h.localization?.coordinate?.latitude ?? null,
     lon: h.localization?.coordinate?.longitude ?? null,
-    currency: h.localization?.currencyCode || null,
+    currency: lowest?.rateAmount != null ? "USD" : h.localization?.currencyCode || null,
     homeUrl: h.facilityOverview?.homeUrlTemplate || null,
+    amount: lowest?.rateAmount ?? null,
+    amountFmt: lowest?.rateAmountFmt || null,
+    ratePlanCode: lowest?.ratePlanCode || null,
+    ratePlanName: lowest?.ratePlan?.ratePlanName || null,
   };
 }
 
@@ -1030,15 +1481,430 @@ function findContainingQuadrantIds(lat, lon, quadrants) {
   return hits;
 }
 
+/** Pick the Go Hilton map quadrant used for a country inventory request. */
+function pickCountryQuadrantId(countryCode, quadrants) {
+  const code = String(countryCode || "").toUpperCase();
+  if (!code) return null;
+  const hits = [];
+  for (const q of quadrants || []) {
+    if (!q?.id) continue;
+    const codes = (q.countries || [])
+      .map((c) => String(c?.code || c || "").toUpperCase())
+      .filter(Boolean);
+    if (!codes.includes(code)) continue;
+    hits.push({
+      id: q.id,
+      depth: String(q.id).split("::").length,
+      exclusive: codes.length === 1,
+    });
+  }
+  if (!hits.length) return null;
+  // Prefer a tile that is only this country; among those, prefer broader (shallower)
+  // coverage so one hotelSummaryOptions call returns the full country inventory.
+  hits.sort((a, b) => {
+    if (a.exclusive !== b.exclusive) return a.exclusive ? -1 : 1;
+    if (a.depth !== b.depth) return a.depth - b.depth;
+    return String(a.id).localeCompare(String(b.id));
+  });
+  return hits[0].id;
+}
+
+function boundsIntersect(a, b) {
+  const an = a?.northeast;
+  const as = a?.southwest;
+  const bn = b?.northeast;
+  const bs = b?.southwest;
+  if (!an || !as || !bn || !bs) return false;
+  const aMinLat = Math.min(as.latitude, an.latitude);
+  const aMaxLat = Math.max(as.latitude, an.latitude);
+  const bMinLat = Math.min(bs.latitude, bn.latitude);
+  const bMaxLat = Math.max(bs.latitude, bn.latitude);
+  if (aMinLat > bMaxLat || bMinLat > aMaxLat) return false;
+  const aMinLon = Math.min(as.longitude, an.longitude);
+  const aMaxLon = Math.max(as.longitude, an.longitude);
+  const bMinLon = Math.min(bs.longitude, bn.longitude);
+  const bMaxLon = Math.max(bs.longitude, bn.longitude);
+  return !(aMinLon > bMaxLon || bMinLon > aMaxLon);
+}
+
+/** Drop tiles that fully contain another selected tile — Hilton queries the leaves. */
+function keepLeafQuadrants(ids) {
+  const list = [...new Set(ids)];
+  return list.filter((id) => !list.some((other) => other !== id && other.startsWith(`${id}::`)));
+}
+
+/**
+ * The quadrants hilton.com queries for a search: every tile covering the country
+ * (or intersecting the geocoded bounds), one hotelSummaryOptions call each.
+ */
+function selectSearchQuadrantIds(quadrants, { countryCode = null, bounds = null, isCountry = false } = {}) {
+  const code = String(countryCode || "").toUpperCase();
+  const byCountry = [];
+  const byBounds = [];
+  for (const q of quadrants || []) {
+    if (!q?.id) continue;
+    const codes = (q.countries || [])
+      .map((c) => String(c?.code || c || "").toUpperCase())
+      .filter(Boolean);
+    if (code && codes.includes(code)) byCountry.push(q.id);
+    if (bounds && boundsIntersect(q.bounds, bounds)) byBounds.push(q.id);
+  }
+  if (isCountry && byCountry.length) return keepLeafQuadrants(byCountry);
+  if (byBounds.length) return keepLeafQuadrants(byBounds);
+  return keepLeafQuadrants(byCountry);
+}
+
+async function fetchQuadrantHotels(quadrantId, guestLocationCountry) {
+  const json = await hiltonGraphql(
+    "hotelSummaryOptions",
+    QUADRANT_SUMMARY_QUERY,
+    {
+      language: "en",
+      input: { quadrantId, guestLocationCountry },
+    },
+    "dx_shop_search_app"
+  );
+  return extractHotelNodes(json?.data?.hotelSummaryOptions?.hotels)
+    .map(normalizeHotel)
+    .filter(Boolean);
+}
+
+/**
+ * Whole-place inventory the way the Go Hilton results page builds it: resolve the
+ * quadrant tree once, then fan out one request per tile and merge on ctyhocn.
+ */
+async function fetchInventoryByQuadrants(match, countryCode, { isCountry = false } = {}) {
+  const quadrants = await loadHotelQuadrants();
+  const guestLocationCountry = asIso2CountryCode(countryCode) || "US";
+  const ids = selectSearchQuadrantIds(quadrants, {
+    countryCode: guestLocationCountry,
+    bounds: match?.geometry?.bounds || null,
+    isCountry,
+  });
+  if (!ids.length) return { hotels: [], quadrants: 0, failures: 0, lastError: null };
+
+  let failures = 0;
+  let lastError = null;
+  const batches = await mapPool(ids, 6, async (id) => {
+    try {
+      return await fetchQuadrantHotels(id, guestLocationCountry);
+    } catch (err) {
+      if (isUnauthorizedError(err)) throw err;
+      failures += 1;
+      lastError = err;
+      return [];
+    }
+  });
+
+  const seen = new Set();
+  const hotels = [];
+  for (const list of batches) {
+    for (const h of list || []) {
+      if (!h?.ctyhocn || seen.has(h.ctyhocn)) continue;
+      seen.add(h.ctyhocn);
+      hotels.push(h);
+    }
+  }
+  return { hotels, quadrants: ids.length, failures, lastError };
+}
+
+async function resolveCountryQuadrantId(countryCode, place = null) {
+  const code = String(countryCode || "").toUpperCase();
+  const quadrants = await loadHotelQuadrants();
+  let quadrantId = pickCountryQuadrantId(code, quadrants);
+  if (quadrantId) return quadrantId;
+
+  // Fallback: center of country → containing map tile (Go Hilton map search style).
+  let lat = place?.lat;
+  let lon = place?.lon;
+  if (lat == null || lon == null) {
+    const geoQuery = [place?.country, code].filter(Boolean).join(", ") || code;
+    const geo = await geocodeDestination(geoQuery);
+    lat = geo.lat;
+    lon = geo.lon;
+  }
+  const matches = findContainingQuadrantIds(lat, lon, quadrants);
+  if (!matches.length) return null;
+  // Prefer mid-depth tiles similar to go-hilton country search captures.
+  const mid = matches.filter((m) => m.depth >= 5 && m.depth <= 9);
+  return (mid[0] || matches[0]).id;
+}
+
+function normalizeLocationPath(uriOrPath) {
+  if (!uriOrPath) return null;
+  let path = String(uriOrPath).trim();
+  try {
+    if (/^https?:\/\//i.test(path)) path = new URL(path).pathname;
+  } catch {
+    /* keep raw */
+  }
+  if (!path.startsWith("/")) path = `/${path}`;
+  if (!path.endsWith("/")) path = `${path}/`;
+  // Go Hilton geocode often returns bare slugs like "/usa/" — GraphQL only
+  // resolves the locations tree: "/en/locations/usa/", "/en/locations/usa/texas/", …
+  if (!path.includes("/locations/")) {
+    const slug = path.split("/").filter(Boolean).join("/");
+    if (slug) path = `/en/locations/${slug}/`;
+  }
+  return path;
+}
+
+function childLocationPaths(countryPath, interlinks) {
+  const base = normalizeLocationPath(countryPath);
+  if (!base) return [];
+  const baseParts = base.split("/").filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  for (const group of interlinks || []) {
+    for (const link of group?.links || []) {
+      const path = normalizeLocationPath(link?.uri);
+      if (!path || !path.startsWith(base) || path === base) continue;
+      const parts = path.split("/").filter(Boolean);
+      // Only immediate children (e.g. /en/locations/united-states/texas/).
+      if (parts.length !== baseParts.length + 1) continue;
+      if (seen.has(path)) continue;
+      seen.add(path);
+      out.push(path);
+    }
+  }
+  return out;
+}
+
+/** Hilton US state location slugs under /en/locations/usa/{slug}/ */
+const US_STATE_LOCATION_SLUGS = [
+  "alabama",
+  "alaska",
+  "arizona",
+  "arkansas",
+  "california",
+  "colorado",
+  "connecticut",
+  "delaware",
+  "district-of-columbia",
+  "florida",
+  "georgia",
+  "hawaii",
+  "idaho",
+  "illinois",
+  "indiana",
+  "iowa",
+  "kansas",
+  "kentucky",
+  "louisiana",
+  "maine",
+  "maryland",
+  "massachusetts",
+  "michigan",
+  "minnesota",
+  "mississippi",
+  "missouri",
+  "montana",
+  "nebraska",
+  "nevada",
+  "new-hampshire",
+  "new-jersey",
+  "new-mexico",
+  "new-york",
+  "north-carolina",
+  "north-dakota",
+  "ohio",
+  "oklahoma",
+  "oregon",
+  "pennsylvania",
+  "rhode-island",
+  "south-carolina",
+  "south-dakota",
+  "tennessee",
+  "texas",
+  "utah",
+  "vermont",
+  "virginia",
+  "washington",
+  "west-virginia",
+  "wisconsin",
+  "wyoming",
+];
+
+function knownCountryRegionPaths(countryCode, countrySlug) {
+  const code = String(countryCode || "").toUpperCase();
+  const root = String(countrySlug || countryPathName(null, code) || "")
+    .replace(/^\/+|\/+$/g, "")
+    .toLowerCase();
+  const isUs =
+    code === "US" ||
+    code === "USA" ||
+    root === "usa" ||
+    root === "united-states";
+  // Hilton USA find-hotels always fans out under /en/locations/usa/{state}/.
+  if (isUs) {
+    return US_STATE_LOCATION_SLUGS.map((s) => `/en/locations/usa/${s}/`);
+  }
+  return [];
+}
+
+async function fetchGeocodePathInventory(path, countryCode, queryLimit = 150) {
+  const guestLocationCountry = asIso2CountryCode(countryCode) || "US";
+  const json = await hiltonGraphql(
+    "hotelSummaryOptions_geocodePage",
+    COUNTRY_GEOCODE_QUERY,
+    {
+      language: "en",
+      path,
+      queryLimit,
+      input: { guestLocationCountry },
+    },
+    "dx_shop_search_app"
+  );
+  const page = json?.data?.geocodePage;
+  if (!page) {
+    throw new Error("Not Found");
+  }
+  const hotels = extractHotelNodes(page?.hotelSummaryOptions?.hotels)
+    .map(normalizeHotel)
+    .filter(Boolean);
+  const interlinks = page?.location?.pageInterlinks || [];
+  return { hotels, interlinks };
+}
+
+async function mapPool(items, concurrency, worker) {
+  const list = Array.isArray(items) ? items : [];
+  const results = new Array(list.length);
+  let next = 0;
+  async function run() {
+    while (next < list.length) {
+      const i = next++;
+      results[i] = await worker(list[i], i);
+    }
+  }
+  const n = Math.max(1, Math.min(concurrency, list.length || 1));
+  await Promise.all(Array.from({ length: n }, () => run()));
+  return results;
+}
+
+/**
+ * Country hotel inventory from Hilton locations geocodePage.
+ * Country-level paths often 404 in GraphQL (HTML can still exist) — use state/region
+ * pages instead (same approach as Hilton's own location directory crawlers).
+ */
+async function fetchCountryHotelInventory(countryCode, place = null) {
+  const code = String(countryCode || "").toUpperCase();
+  if (!/^[A-Z]{2}$/.test(code)) {
+    throw new Error(`Invalid country code “${countryCode || ""}”.`);
+  }
+  const queryLimit = 150;
+  const slugs = countryLocationPathCandidates(place?.country, code);
+  const countrySlug = slugs[0] || "usa";
+  const countryPath = `/en/locations/${countrySlug}/`;
+
+  let hotels = [];
+  const seen = new Set();
+  const addHotels = (list) => {
+    let added = 0;
+    for (const h of list || []) {
+      if (!h?.ctyhocn || seen.has(h.ctyhocn)) continue;
+      seen.add(h.ctyhocn);
+      hotels.push(h);
+      added += 1;
+    }
+    return added;
+  };
+
+  // Optional: country page (works for some countries; USA GraphQL is often Not Found).
+  let childPaths = [];
+  let lastError = null;
+  const skipCountryPage = code === "US";
+  if (!skipCountryPage) {
+    for (const slug of slugs) {
+      const path = `/en/locations/${slug}/`;
+      try {
+        const primary = await fetchGeocodePathInventory(path, code, queryLimit);
+        addHotels(primary.hotels);
+        childPaths = childLocationPaths(path, primary.interlinks);
+        break;
+      } catch (err) {
+        lastError = err;
+        if (isGeocodeNotFoundError(err)) continue;
+        throw err;
+      }
+    }
+  }
+
+  // USA / large countries: always walk known state (or region) pages.
+  const knownRegions = knownCountryRegionPaths(code, countrySlug);
+  if (knownRegions.length) {
+    const fromInterlinks = new Set(childPaths);
+    for (const path of knownRegions) {
+      if (!fromInterlinks.has(path)) childPaths.push(path);
+    }
+  }
+
+  if (childPaths.length) {
+    const batches = await mapPool(childPaths, 3, async (path) => {
+      try {
+        const page = await fetchGeocodePathInventory(path, code, queryLimit);
+        const list = page.hotels || [];
+        // Dense states hit the 150 cap — pull city pages too.
+        if (list.length >= queryLimit) {
+          const cities = childLocationPaths(path, page.interlinks);
+          if (cities.length) {
+            const cityBatches = await mapPool(cities, 2, async (cityPath) => {
+              try {
+                const cityPage = await fetchGeocodePathInventory(cityPath, code, queryLimit);
+                return cityPage.hotels || [];
+              } catch {
+                return [];
+              }
+            });
+            return list.concat(cityBatches.flat());
+          }
+        }
+        return list;
+      } catch {
+        return [];
+      }
+    });
+    for (const list of batches) addHotels(list);
+  }
+
+  // Fallback: single map quadrant (viewport-scoped; last resort).
+  if (!hotels.length) {
+    const quadrantId = await resolveCountryQuadrantId(code, place);
+    if (!quadrantId) {
+      throw lastError || new Error(`No Hilton hotels found for ${code}.`);
+    }
+    const json = await hiltonGraphql(
+      "hotelSummaryOptions",
+      COUNTRY_INVENTORY_QUERY,
+      {
+        language: "en",
+        queryLimit,
+        input: {
+          quadrantId,
+          guestLocationCountry: code,
+        },
+      },
+      "dx_shop_search_app"
+    );
+    addHotels((json?.data?.hotelSummaryOptions?.hotels || []).map(normalizeHotel).filter(Boolean));
+    return { path: countryPath, quadrantId, hotels };
+  }
+
+  return { path: countryPath, quadrantId: null, hotels };
+}
+
 function sortHotelsByDistance(hotels, place) {
   return hotels
     .map((h) => {
-      const dist =
-        h.distance ??
-        (h.lat != null && h.lon != null && place?.lat != null && place?.lon != null
-          ? haversineKm(place.lat, place.lon, h.lat, h.lon)
-          : Number.POSITIVE_INFINITY);
-      return { ...h, distance: Number.isFinite(dist) ? dist : h.distance };
+      // Always prefer distance from the geocoded place center. Quadrant
+      // hotelSummaryOptions `distance` is tile-relative and will pull in
+      // Marseille/Barcelona for a Sicily search if trusted.
+      let dist = Number.POSITIVE_INFINITY;
+      if (h.lat != null && h.lon != null && place?.lat != null && place?.lon != null) {
+        dist = haversineKm(place.lat, place.lon, h.lat, h.lon);
+      } else if (Number.isFinite(Number(h.distance))) {
+        dist = Number(h.distance);
+      }
+      return { ...h, distance: Number.isFinite(dist) ? dist : null };
     })
     .sort((a, b) => (a.distance ?? 1e9) - (b.distance ?? 1e9));
 }
@@ -1081,20 +1947,72 @@ function citiesEquivalent(a, b) {
   return false;
 }
 
+function isRegionSuggestion(suggestion) {
+  if (!suggestion || isCountrySuggestion(suggestion)) return false;
+  if (suggestion.type === "region") return true;
+  // Hilton often returns state/province predictions with place_id: null.
+  return Boolean(suggestion.state && !suggestion.city && !suggestion.ctyhocn);
+}
+
 function radiusKmForSuggestion(suggestion) {
   const type = suggestion?.type || "destination";
   if (type === "hotel") return 5;
   if (type === "airport") return 45;
   if (type === "poi") return 35;
+  if (type === "country") return null; // full country inventory — no radius cut
+  if (type === "region" || isRegionSuggestion(suggestion)) return 350;
   // City / destination: match Go Hilton “place + nearby” (Malpensa, Monza, Como, …).
   return 100;
 }
 
+function countryCodeFromPlaceId(placeId) {
+  const m = typeof placeId === "string" ? placeId.match(/^dx-location::country::([a-z]{2})$/i) : null;
+  return m ? m[1].toUpperCase() : null;
+}
+
+/** Hilton GraphQL expects ISO-3166 alpha-2 (e.g. "US"), not "United States" / "USA". */
+function asIso2CountryCode(value) {
+  const s = String(value || "").trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(s) ? s : null;
+}
+
+function resolveGuestLocationCountry(match, resolved, placeId) {
+  return (
+    countryCodeFromPlaceId(placeId) ||
+    asIso2CountryCode(match?.address?.country) ||
+    asIso2CountryCode(resolved?.countryCode) ||
+    asIso2CountryCode(match?.address?.countryCode) ||
+    "US"
+  );
+}
+
+/** Normalize Hilton hotelSummaryOptions.hotels (array or Relay-style connection). */
+function extractHotelNodes(hotelsField) {
+  if (!hotelsField) return [];
+  if (Array.isArray(hotelsField)) return hotelsField;
+  if (Array.isArray(hotelsField.nodes)) return hotelsField.nodes;
+  if (Array.isArray(hotelsField.edges)) {
+    return hotelsField.edges.map((e) => e?.node).filter(Boolean);
+  }
+  return [];
+}
+
+function isCountrySuggestion(suggestion) {
+  if (!suggestion) return false;
+  if (suggestion.type === "country") return true;
+  return Boolean(countryCodeFromPlaceId(suggestion.placeId));
+}
+
 function placeFromSuggestion(suggestion, fallbackQuery = "") {
   if (!suggestion) return null;
-  const city = suggestion.city || suggestion.primary || null;
-  const country = suggestion.country || "";
-  const countryCode = String(suggestion.countryCode || "").toUpperCase() || null;
+  const countryCode =
+    String(suggestion.countryCode || countryCodeFromPlaceId(suggestion.placeId) || "").toUpperCase() ||
+    null;
+  const isCountry = isCountrySuggestion(suggestion);
+  const isRegion = isRegionSuggestion(suggestion);
+  // For countries/regions, primary is the place name — do not treat it as a city.
+  const city = isCountry || isRegion ? null : suggestion.city || null;
+  const country = suggestion.country || (isCountry ? suggestion.primary : "") || "";
   return {
     lat: suggestion.lat ?? null,
     lon: suggestion.lon ?? null,
@@ -1102,8 +2020,8 @@ function placeFromSuggestion(suggestion, fallbackQuery = "") {
     city,
     country,
     countryCode,
-    state: suggestion.state || "",
-    suggestionType: suggestion.type || "destination",
+    state: isCountry ? "" : suggestion.state || "",
+    suggestionType: isCountry ? "country" : isRegion ? "region" : suggestion.type || "destination",
     placeId: suggestion.placeId || null,
     ctyhocn: suggestion.ctyhocn || null,
   };
@@ -1111,7 +2029,8 @@ function placeFromSuggestion(suggestion, fallbackQuery = "") {
 
 /**
  * Prefer Hilton autocomplete picks the same way the Go Hilton "Where to?" box does:
- * exact city/destination match first, then hotels, then airports/POIs.
+ * countries and cities first, then hotels, then airports/POIs.
+ * Prefer predictions that include a placeId when scores are otherwise close.
  */
 function pickBestSuggestion(suggestions, query) {
   const list = Array.isArray(suggestions) ? suggestions : [];
@@ -1121,15 +2040,24 @@ function pickBestSuggestion(suggestions, query) {
     const primary = String(s.primary || "").toLowerCase();
     const label = String(s.label || s.query || "").toLowerCase();
     const city = String(s.city || "").toLowerCase();
+    const isCountry = isCountrySuggestion(s);
     let score = 0;
-    if (primary === q || label === q || city === q) score += 120;
-    if (primary.startsWith(q) || city.startsWith(q)) score += 60;
+    if (primary === q || label === q) score += 120;
+    if (city === q) score += isCountry ? 0 : 40;
+    if (primary.startsWith(q) || (!isCountry && city.startsWith(q))) score += 60;
     if (label.includes(q)) score += 20;
-    if (s.type === "destination") score += 40;
+    if (isCountry) score += 90;
+    else if (s.type === "destination") score += 40;
+    else if (s.type === "region" || isRegionSuggestion(s)) score += 30;
     else if (s.type === "hotel") score += 25;
     else if (s.type === "airport") score += 10;
     else if (s.type === "poi") score += 8;
-    else if (s.type === "region") score -= 50;
+    // Prefer Hilton placeIds when present (countries + most cities).
+    if (s.placeId) score += 15;
+    // Prefer real country hits over same-named US towns (e.g. Italy, Texas).
+    if (!isCountry && city === q && String(s.countryCode || "").toUpperCase() === "US") {
+      score -= 100;
+    }
     return { s, score };
   });
   scored.sort((a, b) => b.score - a.score);
@@ -1137,7 +2065,18 @@ function pickBestSuggestion(suggestions, query) {
 }
 
 async function resolveDestinationSuggestion(destination, suggestion = null) {
-  if (suggestion?.ctyhocn || suggestion?.city || suggestion?.placeId || suggestion?.query) {
+  // Accept an explicit autocomplete pick (placeId may be null for states/regions).
+  if (
+    suggestion &&
+    (suggestion.ctyhocn ||
+      suggestion.placeId ||
+      suggestion.query ||
+      suggestion.label ||
+      suggestion.primary ||
+      suggestion.type === "region" ||
+      suggestion.type === "country" ||
+      suggestion.type === "destination")
+  ) {
     return suggestion;
   }
   const q = String(destination || "").trim();
@@ -1150,21 +2089,61 @@ async function resolveDestinationSuggestion(destination, suggestion = null) {
   }
 }
 
+function hotelInPlaceBounds(h, bounds) {
+  if (!bounds || h?.lat == null || h?.lon == null) return false;
+  return pointInBounds(h.lat, h.lon, bounds);
+}
+
+function statesEquivalent(a, b) {
+  const na = normalizeCityToken(a);
+  const nb = normalizeCityToken(b);
+  if (!na || !nb) return false;
+  return na === nb;
+}
+
 function filterHotelsToDestination(hotels, place, suggestion) {
   const radiusKm = radiusKmForSuggestion(suggestion);
-  const withDistance = sortHotelsByDistance(hotels, place);
-  const targetCity = place?.city || suggestion?.city || suggestion?.primary;
+  // Country inventory: keep the full Hilton country list (no radius cut).
+  if (radiusKm == null || isCountrySuggestion(suggestion) || place?.suggestionType === "country") {
+    return sortHotelsByDistance(hotels, place);
+  }
 
-  // Go Hilton style: keep anything within radius of the place center.
+  const withDistance = sortHotelsByDistance(hotels, place);
+  const targetCity = place?.city || suggestion?.city || null;
+  const targetState = place?.state || suggestion?.state || null;
+  const isRegion =
+    isRegionSuggestion(suggestion) ||
+    place?.suggestionType === "region" ||
+    (!targetCity && Boolean(targetState));
+
+  // Regions (New Jersey, Sicily, …): prefer geocode bounds, then state match,
+  // then a wider radius around the place center — never tile-relative distance.
+  if (isRegion) {
+    const inBounds = place?.bounds
+      ? withDistance.filter((h) => hotelInPlaceBounds(h, place.bounds))
+      : [];
+    if (inBounds.length) return inBounds;
+
+    if (targetState) {
+      const byState = withDistance.filter((h) => statesEquivalent(h.state, targetState));
+      if (byState.length) return byState;
+    }
+
+    const regionCap = Math.max(radiusKm || 350, 350);
+    return withDistance.filter((h) => {
+      const d = Number(h.distance);
+      return Number.isFinite(d) && d <= regionCap;
+    });
+  }
+
+  // Go Hilton style for cities: keep anything within radius of the place center.
   const nearby = withDistance.filter((h) => {
     const d = Number(h.distance);
     if (Number.isFinite(d)) return d <= radiusKm;
-    // No usable distance — only keep clear same-city hits (avoid far unknowns).
     return targetCity ? citiesEquivalent(h.city, targetCity) : false;
   });
 
   if (nearby.length) {
-    // Same-city first, then nearer suburbs — still all within radius.
     return nearby.sort((a, b) => {
       const aCity = targetCity && citiesEquivalent(a.city, targetCity) ? 0 : 1;
       const bCity = targetCity && citiesEquivalent(b.city, targetCity) ? 0 : 1;
@@ -1211,8 +2190,13 @@ async function fetchHotelsInQuadrants(place, { maxQuadrants = 2 } = {}) {
   return hotels;
 }
 
-async function searchHotelsNearDestination(destination, { limit = 30, suggestion = null } = {}) {
+async function searchHotelsNearDestination(destination, { suggestion = null } = {}) {
   const resolved = await resolveDestinationSuggestion(destination, suggestion);
+  if (!resolved) {
+    throw new Error(
+      `Couldn’t resolve “${String(destination || "").trim()}” via Hilton autocomplete. Pick a suggestion.`
+    );
+  }
   if (resolved?.ctyhocn) {
     const place = placeFromSuggestion(resolved, destination) || {
       displayName: resolved.primary || destination,
@@ -1236,100 +2220,79 @@ async function searchHotelsNearDestination(destination, { limit = 30, suggestion
         },
       ],
       resolvedSuggestion: resolved,
+      inventoryOnly: false,
     };
   }
 
-  // Prefer Hilton autocomplete locality over raw Nominatim free-text.
-  let place = placeFromSuggestion(resolved, destination);
-  const queryForGeo =
+  const address =
     resolved?.query ||
+    resolved?.label ||
     [resolved?.primary, resolved?.secondary].filter(Boolean).join(", ") ||
     destination;
+  // Prefer Hilton placeId when autocomplete provided one (countries + most cities).
+  // States/regions often have place_id: null — geocode by address only in that case.
+  const placeId = resolved?.placeId || "";
 
-  try {
-    const geo = await geocodeDestination(queryForGeo);
-    place = {
-      ...(place || {}),
-      ...geo,
-      city: place?.city || geo.city,
-      country: place?.country || geo.country,
-      countryCode: place?.countryCode || geo.countryCode,
-      state: place?.state || geo.state,
-      displayName: place?.displayName || geo.displayName,
-      suggestionType: resolved?.type || "destination",
-    };
-  } catch (err) {
-    if (!place?.city && !place?.countryCode) throw err;
+  // Same resolve step as Go Hilton after clicking an autocomplete prediction.
+  const match = await hiltonGeocodePlace({ address, placeId });
+  if (!match) {
+    throw new Error(`Hilton could not geocode “${address}”.`);
   }
 
-  const countryPath = countryPathName(place.country, place.countryCode);
-  const citySlug = slugify(place.city || resolved?.primary || destination);
-  const stateSlug = slugify(place.state);
-  const paths = [
-    citySlug ? `/en/locations/${countryPath}/${citySlug}/` : null,
-    citySlug && stateSlug ? `/en/locations/${countryPath}/${stateSlug}/${citySlug}/` : null,
-  ].filter(Boolean);
-
-  const seen = new Set();
-  let hotels = [];
-  let lastError = null;
-  let sourceParts = [];
-
-  const addHotels = (list, source) => {
-    let added = 0;
-    for (const h of list || []) {
-      if (!h?.ctyhocn || seen.has(h.ctyhocn)) continue;
-      seen.add(h.ctyhocn);
-      hotels.push(h);
-      added += 1;
-    }
-    if (added) sourceParts.push(source);
+  // Prefer placeId ISO-2 (dx-location::country::us). match.address.country is often
+  // "USA" which breaks guestLocationCountry and skips the US state fan-out.
+  const countryCode = resolveGuestLocationCountry(match, resolved, placeId);
+  const placeUri = normalizeLocationPath(match?.placeUri);
+  const isCountry = isCountryMatch(match, resolved, placeUri);
+  const isRegion = !isCountry && isRegionMatch(match, resolved, placeUri);
+  const place = {
+    displayName: match.name || address,
+    city: isCountry || isRegion ? null : match.address?.city || resolved?.city || null,
+    state: isCountry
+      ? null
+      : match.address?.stateName || match.address?.state || resolved?.state || null,
+    country: match.address?.countryName || resolved?.country || null,
+    countryCode,
+    lat: match.geometry?.location?.latitude ?? null,
+    lon: match.geometry?.location?.longitude ?? null,
+    placeUri: match.placeUri || null,
+    bounds: match.geometry?.bounds || null,
+    suggestionType: isCountry ? "country" : isRegion ? "region" : match.type || resolved?.type || "destination",
   };
 
-  for (const path of paths) {
+  // Full inventory: map-quadrant fan-out like hilton.com, /en/locations pages as backup.
+  const inventory = await fetchEntirePlaceInventory(match, resolved, countryCode);
+  let hotels = inventory.hotels || [];
+
+  // Quadrant tiles are far larger than a city/region — cut back to the searched place.
+  if (hotels.length && !inventory.isCountry) {
+    hotels = filterHotelsToDestination(hotels, place, resolved);
+  }
+  let source = inventory.source;
+  let lastError = inventory.lastError;
+
+  if (!hotels.length && !inventory.isCountry && place.lat != null && place.lon != null) {
     try {
-      const json = await hiltonGraphql(
-        "hotelSummaryOptions_geocodePage",
-        GEOCODE_QUERY,
-        {
-          language: "en",
-          path,
-          distanceUnit: "kilometer",
-          input: { guestLocationCountry: place.countryCode || "US" },
-        },
-        "dx_shop_search_app"
-      );
-      const list = json?.data?.geocodePage?.hotelSummaryOptions?.hotels || [];
-      addHotels(list.map(normalizeHotel).filter(Boolean), `geocodePage:${path}`);
-      if (hotels.length) break;
+      hotels = await fetchHotelsInQuadrants(place, { maxQuadrants: 6 });
+      hotels = filterHotelsToDestination(hotels, place, resolved);
+      source = source ? `${source}+quadrant` : "quadrant";
     } catch (err) {
       lastError = err;
     }
   }
-
-  // Always merge local map-quadrant hotels so “nearby” (Malpensa, Monza, Como, …) are candidates,
-  // then radius-filter. City pages alone often omit those suburbs.
-  if (place.lat != null && place.lon != null) {
-    try {
-      const quadrantHotels = await fetchHotelsInQuadrants(place, { maxQuadrants: 2 });
-      addHotels(quadrantHotels, "quadrant");
-    } catch (err) {
-      lastError = err;
-    }
-  }
-
-  hotels = filterHotelsToDestination(hotels, place, resolved);
 
   if (!hotels.length) {
-    throw lastError || new Error(`No Hilton hotels found near “${place.displayName || destination}”.`);
+    throw lastError || new Error(`No Hilton hotels found for “${place.displayName}”.`);
   }
 
-  hotels = hotels.slice(0, limit);
+  // Always return the full hotel list for calendar / room scanning (including
+  // country inventory). Broad searches just take longer at a human request pace.
   return {
     place,
     hotels,
     resolvedSuggestion: resolved,
-    source: sourceParts.join("+") || null,
+    source,
+    inventoryOnly: false,
   };
 }
 
@@ -1589,39 +2552,170 @@ async function fetchShopRooms({
     programAccountId: null,
   };
 
+  const discovered = await discoverHiltonAppVersions();
+  const clients = shopAvailClientAttempts(discovered);
   let lastError = null;
-  for (const query of [SHOP_AVAIL_QUERY, SHOP_AVAIL_QUERY_SIMPLE]) {
+
+  // Keep the allowlisted query document fixed — Hilton rejects alternate
+  // selection sets under the same operationName ("Invalid operation name").
+  for (const client of clients) {
     try {
       const json = await hiltonGraphql(
         "hotel_shopAvailOptions_shopAvailProp",
-        query,
+        SHOP_AVAIL_QUERY,
         variables,
-        "dx-res-ui"
+        client.appName,
+        { appVersion: client.appVersion }
       );
       const parsed = normalizeShopRooms(json);
       if (parsed) return localizeShopRoomsPayload(parsed);
       lastError = new Error("No room rates returned for that stay.");
     } catch (err) {
       lastError = err;
+      if (isUnauthorizedError(err)) throw err;
+      // Try next client on allowlist / version mismatches.
+      if (isInvalidOperationNameError(err)) continue;
+      // Other hard failures: still try remaining clients once or twice, then stop.
+      if (/403|blocked|forbidden/i.test(String(err?.message || ""))) continue;
+      break;
     }
   }
   throw lastError || new Error("Room shop failed.");
 }
 
+const MULTI_PROP_PAGE_SIZE = 20;
+
+/** specialRates shape ShopMultiPropAvailQueryInput accepts (no nulls, no extra keys). */
+function multiPropSpecialRates(friendsAndFamily) {
+  return {
+    aaa: false,
+    aarp: false,
+    corporateId: "",
+    governmentMilitary: false,
+    groupCode: "",
+    hhonors: false,
+    lta: false,
+    pnd: "",
+    offerId: null,
+    promoCode: "",
+    senior: false,
+    smb: false,
+    travelAgent: false,
+    teamMember: !friendsAndFamily,
+    familyAndFriends: Boolean(friendsAndFamily),
+    owner: false,
+    ownerHGV: false,
+  };
+}
+
 /**
- * Same endpoint Hilton's "Where to?" box uses:
- * GET https://www.hilton.com/dx-customer/autocomplete?input=...&language=en
+ * Lead rates for one page of hotels (max 20 ctyhocns), the same request the
+ * results page fires as you page through inventory.
  */
-async function autocompleteDestination(query, { limit = 8 } = {}) {
+async function fetchMultiPropRates({
+  ctyhocns,
+  arrivalDate,
+  departureDate,
+  numAdults = 1,
+  numChildren = 0,
+  numRooms = 1,
+  childAges = [],
+  friendsAndFamily = true,
+  guestId = null,
+  guestLocationCountry = "US",
+}) {
+  const codes = [...new Set((ctyhocns || []).map((c) => String(c || "").toUpperCase()).filter(Boolean))]
+    .slice(0, MULTI_PROP_PAGE_SIZE);
+  if (!codes.length) return [];
+
+  const json = await hiltonGraphql(
+    "shopMultiPropAvail",
+    MULTI_PROP_AVAIL_QUERY,
+    {
+      language: "en",
+      ctyhocns: codes,
+      input: {
+        guestId: guestId || null,
+        guestLocationCountry: asIso2CountryCode(guestLocationCountry) || "US",
+        arrivalDate,
+        departureDate,
+        numAdults,
+        numChildren,
+        numRooms,
+        childAges: childAges || [],
+        ratePlanCodes: [],
+        rateCategoryTokens: [],
+        specialRates: multiPropSpecialRates(friendsAndFamily),
+      },
+    },
+    "dx_shop_search_app"
+  );
+
+  const results = json?.data?.shopMultiPropAvail || [];
+  const rates = [];
+  for (const entry of results) {
+    const ctyhocn = entry?.ctyhocn ? String(entry.ctyhocn).toUpperCase() : null;
+    if (!ctyhocn) continue;
+    const lowest = entry.summary?.lowest;
+    const plan = lowest?.ratePlan || {};
+    const specialRateType = plan.specialRateType || null;
+    const amount = lowest?.rateAmount ?? null;
+    rates.push({
+      ctyhocn,
+      // rateAmount/amountAfterTax are requested as USD, so no FX pass is needed.
+      amount,
+      amountFmt: lowest?.rateAmountFmt || (amount != null ? `$${Math.round(amount)}` : null),
+      amountAfterTax: lowest?.amountAfterTax ?? null,
+      currency: amount != null ? "USD" : entry.currencyCode || null,
+      currencyOriginal: entry.currencyCode || null,
+      ratePlanCode: lowest?.ratePlanCode || null,
+      ratePlanName: plan.ratePlanName || null,
+      specialRateType,
+      isGoRate:
+        specialRateType === "familyAndFriends" ||
+        specialRateType === "teamMember" ||
+        /go hilton/i.test(plan.ratePlanName || ""),
+      lengthOfStay: entry.lengthOfStay ?? null,
+      statusCode: entry.statusCode ?? null,
+      statusMessage: entry.statusMessage || null,
+      soldOut: String(entry.summary?.status?.type || "").toLowerCase() === "unavailable",
+    });
+  }
+  return rates;
+}
+
+/**
+ * Same endpoint Hilton's Go Hilton "Where to?" box uses:
+ * GET /dx-customer/autocomplete?input=...&language=en
+ */
+async function autocompleteDestination(query, { limit = 12, location = null } = {}) {
   const q = String(query || "").trim();
   if (q.length < 2) return { suggestions: [], source: "empty" };
 
   const url = new URL("https://www.hilton.com/dx-customer/autocomplete");
   url.searchParams.set("input", q);
   url.searchParams.set("language", "en");
+  const loc =
+    location && Number.isFinite(Number(location.lat)) && Number.isFinite(Number(location.lon))
+      ? `${Number(location.lat)},${Number(location.lon)}`
+      : null;
+  if (loc) url.searchParams.set("location", loc);
+
+  const headers = {
+    accept: "*/*",
+    origin: "https://www.hilton.com",
+    referer: "https://www.hilton.com/en/go-hilton/",
+  };
+  try {
+    const guestId = await readGuestIdFromCookies();
+    if (guestId) headers["dx-map-session-token"] = String(guestId);
+  } catch {
+    /* optional */
+  }
 
   const { ok, status, text } = await hiltonPageFetch(url.toString(), {
     method: "GET",
+    headers,
   });
   if (!ok) {
     throw new Error(`Autocomplete failed (${status}).`);
@@ -1644,16 +2738,23 @@ async function autocompleteDestination(query, { limit = 8 } = {}) {
 
     const placeId = p.place_id || null;
     const hotelMatch = typeof placeId === "string" ? placeId.match(/^dx-hotel::([a-z0-9]+)$/i) : null;
+    const countryFromId = countryCodeFromPlaceId(placeId);
+    const countryCode = (countryFromId || p.address?.country || "").toString().toUpperCase() || null;
     const rawType = String(p.type || "").toLowerCase();
+    const hasState = Boolean(p.address?.state || p.address?.stateName);
+    const hasCity = Boolean(p.address?.city);
+    // Match Hilton prediction kinds (country place_id, state-only geocode, etc.).
     const type = hotelMatch || rawType === "property"
       ? "hotel"
-      : rawType === "airport"
-        ? "airport"
-        : rawType === "pointofinterest" || rawType === "poi"
-          ? "poi"
-          : rawType === "region"
-            ? "region"
-            : "destination"; // Hilton city hits often use type "geocode"
+      : countryFromId
+        ? "country"
+        : rawType === "airport"
+          ? "airport"
+          : rawType === "pointofinterest" || rawType === "poi"
+            ? "poi"
+            : hasState && !hasCity && !countryFromId
+              ? "region"
+              : "destination";
 
     suggestions.push({
       id: placeId || `${type}:${p.description}`,
@@ -1664,21 +2765,26 @@ async function autocompleteDestination(query, { limit = 8 } = {}) {
       query: p.description || primary,
       placeId,
       ctyhocn: hotelMatch ? hotelMatch[1].toUpperCase() : null,
-      city: p.address?.city || null,
-      state: p.address?.stateName || p.address?.state || null,
-      country: p.address?.countryName || null,
-      countryCode: p.address?.country || null,
+      city: type === "country" || type === "region" ? null : p.address?.city || null,
+      state:
+        type === "country"
+          ? null
+          : p.address?.stateName || p.address?.state || null,
+      country: p.address?.countryName || (type === "country" ? primary : null),
+      countryCode,
     });
-    if (suggestions.length >= Math.max(limit * 2, 12)) break;
   }
 
-  return { suggestions: suggestions.slice(0, Math.max(limit * 2, 12)), source: "hilton" };
+  // Keep Hilton's prediction order and full list (same as go-hilton.com).
+  return { suggestions, source: "hilton" };
 }
 
 export {
   searchHotelsNearDestination,
   fetchCalendar,
   fetchShopRooms,
+  fetchMultiPropRates,
+  MULTI_PROP_PAGE_SIZE,
   autocompleteDestination,
   syncGuestIdFromCookies,
   getAuthSession,

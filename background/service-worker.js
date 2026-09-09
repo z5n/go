@@ -2,6 +2,8 @@ import {
   searchHotelsNearDestination,
   fetchCalendar,
   fetchShopRooms,
+  fetchMultiPropRates,
+  MULTI_PROP_PAGE_SIZE,
   autocompleteDestination,
   syncGuestIdFromCookies,
   getAuthSession,
@@ -15,6 +17,7 @@ import {
   getCachedShopRooms,
   setCachedShopRooms,
   deleteCachedShopRooms,
+  listCachedCalendars,
   pruneStaleCache,
 } from "./rate-cache.js";
 import {
@@ -72,7 +75,7 @@ chrome.webRequest.onBeforeRequest.addListener(
 );
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.storage.sync.set({ maxHotels: 25, delayMs: 350 });
+  chrome.storage.sync.set({ delayMs: 1000 });
 });
 
 async function getGuestId() {
@@ -160,23 +163,150 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 let scanCancelled = false;
 
+function buildCachedScanRows(entries, {
+  fromDate = null,
+  toDate = null,
+  nights = null,
+  goOnly,
+  maxRate,
+  minRooms,
+}) {
+  const from = fromDate ? new Date(`${fromDate}T00:00:00`) : null;
+  const to = toDate ? new Date(`${toDate}T00:00:00`) : null;
+  const rows = [];
+  const seenHotels = new Set();
+  let cacheHits = 0;
+
+  // Prefer a real hotel name from any cache entry for the same ctyhocn — refreshes
+  // used to wipe hotelName and leave the code as the display name.
+  const metaByCtyhocn = new Map();
+  for (const entry of entries || []) {
+    const code = String(entry.calendar?.ctyhocn || entry.ctyhocn || "").toUpperCase();
+    if (!code) continue;
+    const name = entry.hotelName && String(entry.hotelName).toUpperCase() !== code
+      ? entry.hotelName
+      : null;
+    const prev = metaByCtyhocn.get(code) || {};
+    metaByCtyhocn.set(code, {
+      hotelName: name || prev.hotelName || null,
+      brandCode: entry.brandCode || prev.brandCode || null,
+      city: entry.city || prev.city || null,
+      country: entry.country || prev.country || null,
+    });
+  }
+
+  for (const entry of entries) {
+    if (scanCancelled) break;
+    cacheHits += 1;
+    const hotelCtyhocn = String(entry.calendar?.ctyhocn || entry.ctyhocn || "").toUpperCase();
+    if (hotelCtyhocn) seenHotels.add(hotelCtyhocn);
+    const meta = metaByCtyhocn.get(hotelCtyhocn) || {};
+    const entryNights = Number(entry.nights) || 1;
+    for (const day of entry.calendar?.days || []) {
+      if (day.amount == null) continue;
+      const arrival = day.arrivalDate;
+      if (!arrival) continue;
+      const d = new Date(`${arrival}T00:00:00`);
+      if (from && d < from) continue;
+      if (to && d > to) continue;
+      if (goOnly && !day.isGoRate) continue;
+      if (maxRate != null && day.amount > maxRate) continue;
+      if ((day.roomsAvail ?? 0) < minRooms) continue;
+      const stayNights = nights == null ? entryNights : Number(nights) || entryNights;
+      const departureDate = addDaysISO(arrival, stayNights);
+      rows.push({
+        ...day,
+        arrivalDate: arrival,
+        departureDate,
+        hotelName: meta.hotelName || entry.hotelName || hotelCtyhocn,
+        brandCode: meta.brandCode || entry.brandCode || null,
+        city: meta.city || entry.city || null,
+        country: meta.country || entry.country || null,
+        ctyhocn: hotelCtyhocn,
+        nights: stayNights,
+        fromCache: true,
+        fetchedAt: entry.fetchedAt || null,
+        bookUrl: `https://www.hilton.com/en/book/reservation/rooms/?ctyhocn=${encodeURIComponent(
+          hotelCtyhocn
+        )}&arrivalDate=${encodeURIComponent(arrival)}&departureDate=${encodeURIComponent(
+          departureDate
+        )}&room1NumAdults=1`,
+      });
+    }
+  }
+
+  return { rows: sortScanRows(rows), cacheHits, hotelsCached: seenHotels.size };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    // Handle cache-only search outside the metrics wrapper so it can't be
+    // dropped by nested handler braces / session bookkeeping.
+    if (message?.type === "SCAN_CACHED_RATES") {
+      scanCancelled = false;
+      pruneStaleCache().catch(() => {});
+      const {
+        fromDate = null,
+        toDate = null,
+        nights = null,
+        friendsAndFamily = true,
+        goOnly = true,
+        maxRate = null,
+        minRooms = 1,
+      } = message;
+      try {
+        const guestId = await getGuestId();
+        const nightsFilter =
+          nights == null || nights === "" || Number.isNaN(Number(nights))
+            ? null
+            : Number(nights);
+        const entries = await listCachedCalendars({
+          nights: nightsFilter,
+          friendsAndFamily,
+          guestId,
+        });
+        const { rows, cacheHits, hotelsCached } = buildCachedScanRows(entries, {
+          fromDate: fromDate || null,
+          toDate: toDate || null,
+          nights: nightsFilter,
+          goOnly,
+          maxRate,
+          minRooms,
+        });
+        const cancelled = scanCancelled;
+        scanCancelled = false;
+        sendResponse({
+          ok: true,
+          rows,
+          guestId,
+          cancelled,
+          done: cacheHits,
+          total: cacheHits,
+          cacheHits,
+          hotelsCached,
+        });
+      } catch (err) {
+        scanCancelled = false;
+        sendResponse({ ok: false, error: String(err?.message || err) });
+      }
+      return;
+    }
+
     await runWithMetricsSession(message?.sessionId || null, async () => {
       if (message?.type === "METRICS_SESSION_START") {
-        const snap = startMetricsSession(message.sessionId);
+        const snap = await startMetricsSession(message.sessionId);
         sendResponse({ ok: true, session: snap });
         return;
       }
 
       if (message?.type === "METRICS_SESSION_END") {
-        const snap = endMetricsSession(message.sessionId);
+        const snap = await endMetricsSession(message.sessionId);
         sendResponse({ ok: true, session: snap });
         return;
       }
 
       if (message?.type === "GET_METRICS") {
-        sendResponse({ ok: true, ...getMetricsSnapshot(message.sessionId || null) });
+        sendResponse({ ok: true, ...(await getMetricsSnapshot(message.sessionId || null)) });
         return;
       }
 
@@ -261,17 +391,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (message?.type === "AUTOCOMPLETE_DESTINATION") {
-      const result = await autocompleteDestination(message.query || "", {
-        limit: message.limit || 8,
-      });
-      sendResponse({ ok: true, ...result });
-      return;
-    }
+        const result = await autocompleteDestination(message.query || "", {
+          limit: message.limit || 8,
+        });
+        const q = String(message.query || "").trim().toLowerCase();
+        const showCached = !q || "cached".startsWith(q) || q.includes("cach");
+        const suggestions = [...(result.suggestions || [])];
+        if (showCached) {
+          suggestions.unshift({
+            id: "goplus:cached",
+            type: "cached",
+            label: "Cached",
+            primary: "Cached",
+            secondary: "Search all cached rates",
+            query: "Cached",
+            placeId: null,
+            ctyhocn: null,
+            city: null,
+            state: null,
+            country: null,
+            countryCode: null,
+          });
+        }
+        sendResponse({ ok: true, ...result, suggestions });
+        return;
+      }
 
-    if (message?.type === "SEARCH_DESTINATION_HOTELS") {
+      if (message?.type === "SEARCH_DESTINATION_HOTELS") {
       scanCancelled = false;
       const result = await searchHotelsNearDestination(message.destination, {
-        limit: message.limit || 25,
         suggestion: message.suggestion || null,
       });
       if (scanCancelled) {
@@ -279,6 +427,53 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
       sendResponse({ ok: true, ...result });
+      return;
+    }
+
+    if (message?.type === "FETCH_INVENTORY_RATES") {
+      const {
+        ctyhocns = [],
+        arrivalDate,
+        departureDate,
+        numAdults = 1,
+        numRooms = 1,
+        friendsAndFamily = true,
+        guestLocationCountry = "US",
+      } = message;
+      if (!ctyhocns.length || !arrivalDate || !departureDate) {
+        sendResponse({ ok: false, error: "Missing stay details for inventory rates." });
+        return;
+      }
+      if (scanCancelled) {
+        sendResponse({ ok: true, rates: [], cancelled: true });
+        return;
+      }
+      const guestId = await getGuestId();
+      try {
+        const rates = await fetchMultiPropRates({
+          ctyhocns: ctyhocns.slice(0, MULTI_PROP_PAGE_SIZE),
+          arrivalDate,
+          departureDate,
+          numAdults,
+          numRooms,
+          friendsAndFamily,
+          guestId,
+          guestLocationCountry,
+        });
+        sendResponse({ ok: true, rates, guestId, cancelled: scanCancelled });
+        await clearUnauthorizedFlag();
+      } catch (err) {
+        if (isUnauthorizedError(err)) {
+          await clearGuestSession();
+          sendResponse({
+            ok: false,
+            unauthorized: true,
+            error: "Hilton session expired. Sign in again to continue.",
+          });
+          return;
+        }
+        sendResponse({ ok: false, error: err?.message || "Inventory rate fetch failed." });
+      }
       return;
     }
 
@@ -366,7 +561,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         currency: "USD",
       };
       try {
-        await deleteCachedCalendar(calendarParams);
+        // Don't delete before rewrite — put merges identity from the prior
+        // record when refresh sends a null/ctyhocn name (common after UI fallback).
         const calendar = await fetchCalendar({
           ctyhocn,
           arrivalDate: monthArrival,
@@ -374,7 +570,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           friendsAndFamily,
           guestId,
         });
-        await setCachedCalendar(calendarParams, calendar);
+        await setCachedCalendar(
+          {
+            ...calendarParams,
+            hotelName: hotelName || null,
+            brandCode: brandCode || null,
+            city: city || null,
+            country: country || null,
+          },
+          calendar
+        );
 
         const dep =
           departureDate || addDaysISO(arrivalDate, lengthOfStay);
@@ -404,6 +609,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         const hotelCtyhocn = calendar.ctyhocn || ctyhocn;
+        const resolvedName =
+          hotelName &&
+          String(hotelName).toUpperCase() !== String(hotelCtyhocn).toUpperCase()
+            ? hotelName
+            : null;
         const days = (calendar.days || [])
           .filter((day) => day?.arrivalDate && day.amount != null)
           .map((day) => {
@@ -413,10 +623,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               ...day,
               arrivalDate: arrival,
               departureDate: departure,
-              hotelName,
-              brandCode,
-              city,
-              country,
+              hotelName: resolvedName,
+              brandCode: brandCode || null,
+              city: city || null,
+              country: country || null,
               ctyhocn: hotelCtyhocn,
               nights: lengthOfStay,
               fromCache: false,
@@ -466,7 +676,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         goOnly = true,
         maxRate = null,
         minRooms = 1,
-        delayMs = 350,
+        delayMs = 1000,
       } = message;
 
       const guestId = await getGuestId();
@@ -503,7 +713,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 friendsAndFamily,
                 guestId,
               });
-              await setCachedCalendar(cacheParams, calendar);
+              await setCachedCalendar(
+                {
+                  ...cacheParams,
+                  hotelName: hotel.name || null,
+                  brandCode: hotel.brandCode || null,
+                  city: hotel.city || null,
+                  country: hotel.country || null,
+                },
+                calendar
+              );
             }
 
             for (const day of calendar.days || []) {
@@ -528,6 +747,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 ctyhocn,
                 nights,
                 fromCache,
+                fetchedAt: fromCache ? calendar.fetchedAt || null : null,
                 bookUrl: `https://www.hilton.com/en/book/reservation/rooms/?ctyhocn=${encodeURIComponent(
                   ctyhocn
                 )}&arrivalDate=${encodeURIComponent(arrival)}&departureDate=${encodeURIComponent(

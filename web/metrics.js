@@ -84,7 +84,7 @@ function sessionHtml(session) {
   const status = current ? "Current" : "Previous";
   const statusClass = current ? "ok" : "";
   const events = (session.events || []).slice().reverse();
-  const title = current ? "Current session" : `Previous session · ${id.slice(0, 8)}…`;
+  const title = current ? "Current session" : "Previous session";
 
   return `<article
     class="metrics-session${current ? " current" : " previous"}${open ? "" : " collapsed"}"
@@ -109,6 +109,16 @@ function sessionHtml(session) {
       </div>
       <div class="metrics-session-total">${session.total} requests</div>
     </button>
+    <div class="metrics-session-id-row">
+      <span class="metrics-session-id-label">Session ID</span>
+      <code class="metrics-session-id mono" title="${escapeHtml(id)}">${escapeHtml(id)}</code>
+      <button
+        type="button"
+        class="ghost-btn metrics-copy-id"
+        data-copy-session-id="${escapeHtml(id)}"
+        title="Copy session ID"
+      >Copy</button>
+    </div>
     <div class="metrics-session-body">
       <div class="metrics-grid">
         ${entriesHtml("By kind", session.byKind)}
@@ -150,6 +160,26 @@ function sessionHtml(session) {
   </article>`;
 }
 
+async function copySessionId(sessionId, button) {
+  const id = String(sessionId || "");
+  if (!id) return;
+  try {
+    await navigator.clipboard.writeText(id);
+    if (button) {
+      const prev = button.textContent;
+      button.textContent = "Copied";
+      button.classList.add("copied");
+      setTimeout(() => {
+        button.textContent = prev || "Copy ID";
+        button.classList.remove("copied");
+      }, 1200);
+    }
+  } catch {
+    // Fallback for restricted clipboard — select via prompt.
+    window.prompt("Copy session ID:", id);
+  }
+}
+
 async function refreshMetrics() {
   const res = await sendMessage({ type: "GET_METRICS" });
   if (!res.ok) {
@@ -178,6 +208,13 @@ async function refreshMetrics() {
 function boot() {
   $("refreshMetricsBtn").addEventListener("click", refreshMetrics);
   $("metricsBody").addEventListener("click", (e) => {
+    const copyBtn = e.target.closest("[data-copy-session-id]");
+    if (copyBtn?.dataset.copySessionId) {
+      e.preventDefault();
+      e.stopPropagation();
+      copySessionId(copyBtn.dataset.copySessionId, copyBtn);
+      return;
+    }
     const btn = e.target.closest("[data-session-toggle]");
     if (!btn?.dataset.sessionToggle) return;
     e.preventDefault();

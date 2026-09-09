@@ -46,49 +46,71 @@
                 />
                 <div id="destinationSuggest" class="suggest-panel" hidden role="listbox"></div>
               </label>
-              <label class="field">
+              <label class="field date-field">
                 <span class="field-label">Search from</span>
-                <input id="fromDate" name="fromDate" type="date" required />
+                <input id="fromDate" name="fromDate" type="text" inputmode="none" autocomplete="off" />
               </label>
-              <label class="field">
+              <label class="field date-field">
                 <span class="field-label">Search to</span>
-                <input id="toDate" name="toDate" type="date" required />
+                <input id="toDate" name="toDate" type="text" inputmode="none" autocomplete="off" />
               </label>
               <label class="field field-sm">
                 <span class="field-label">Nights</span>
-                <input id="nights" name="nights" type="number" min="1" max="7" value="1" title="Length of stay in nights (check-out = check-in + nights)" />
+                <input id="nights" name="nights" type="number" min="1" max="7" value="1" title="Length of stay in nights (check-out = check-in + nights). Clear when searching Cached to include all stay lengths." />
               </label>
               <button class="search-btn" type="submit" id="searchBtn">Search</button>
             </div>
           </div>
 
           <div class="search-filters">
-            <div class="filters-label">Filters</div>
+            <div class="filters-label">Parameters</div>
             <div class="filters-row">
               <label class="chip chip-sm">
-                <span class="chip-label">Max rate</span>
+                <span class="chip-label">Max price</span>
                 <input id="maxRate" type="number" min="0" step="1" placeholder="any" />
               </label>
               <label class="chip chip-sm">
                 <span class="chip-label">Min rooms</span>
                 <input id="minRooms" type="number" min="1" max="9" value="1" />
               </label>
-              <label class="chip chip-sm">
-                <span class="chip-label">Hotels</span>
-                <input id="maxHotels" type="number" min="1" max="40" value="20" />
-              </label>
-              <label class="chip check">
-                <input id="goOnly" type="checkbox" />
-                <span class="chip-label">Go rates only</span>
-              </label>
-              <label class="chip chip-rate-type">
-                <span class="chip-label">Rate type</span>
-                <select id="rateType">
-                  <option value="fnf">Friends &amp; Family</option>
-                  <option value="tm">Team Member</option>
-                </select>
-              </label>
-              <div class="dow-filter">
+              <div class="dow-filter rate-type-filter">
+                <button
+                  type="button"
+                  class="dow-trigger"
+                  id="rateTypeTrigger"
+                  aria-expanded="false"
+                  aria-controls="rateTypePanel"
+                >
+                  <span class="dow-trigger-label">Rate type</span>
+                  <span class="dow-trigger-meta" id="rateTypeMeta"></span>
+                  <span class="dow-chevron" aria-hidden="true">▾</span>
+                </button>
+                <div class="dow-panel" id="rateTypePanel" hidden>
+                  <div class="dow-days" id="rateTypeOptions" role="listbox" aria-label="Rate type">
+                    <label>
+                      <input type="radio" name="rateTypeChoice" value="fnf" checked />
+                      Friends &amp; Family
+                    </label>
+                    <label>
+                      <input type="radio" name="rateTypeChoice" value="tm" />
+                      Team Member
+                    </label>
+                  </div>
+                </div>
+                <input type="hidden" id="rateType" name="rateType" value="fnf" />
+              </div>
+            </div>
+          </div>
+        </form>
+
+        <section class="status-bar" id="statusBar">Enter a destination and date range to begin.</section>
+        <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+
+        <section class="results-wrap">
+          <div class="results-meta">
+            <div id="resultsLabel">No results yet</div>
+            <div class="results-tools" id="resultsTools">
+              <div class="dow-filter results-tool">
                 <button type="button" class="dow-trigger" id="dowTrigger" aria-expanded="false" aria-controls="dowPanel">
                   <span class="dow-trigger-label">Day of Week</span>
                   <span class="dow-trigger-meta" id="dowTriggerMeta"></span>
@@ -111,49 +133,124 @@
                 </div>
               </div>
             </div>
-          </div>
-        </form>
-
-        <section class="status-bar" id="statusBar">Enter a destination and date range to begin.</section>
-        <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
-
-        <section class="results-wrap">
-          <div class="results-meta">
-            <div id="resultsLabel">No results yet</div>
             <button type="button" class="ghost-btn" id="exportBtn" disabled>Export CSV</button>
           </div>
           <div class="table-scroll">
             <table class="results" id="resultsTable">
               <thead>
                 <tr>
-                  <th><button type="button" class="sort-btn" data-sort="arrivalDate">Check-in</button></th>
-                  <th><button type="button" class="sort-btn" data-sort="hotelName">Hotel</button></th>
-                  <th><button type="button" class="sort-btn" data-sort="brandCode">Brand</button></th>
-                  <th class="city-filter-th">
-                    <div class="city-filter">
+                  <th class="col-filter-th">
+                    <div class="col-filter">
                       <button
                         type="button"
-                        class="city-filter-trigger"
-                        id="cityFilterTrigger"
+                        class="col-filter-trigger"
+                        data-col-filter="arrivalDate"
                         aria-expanded="false"
                         aria-haspopup="true"
                       >
-                        <span class="city-filter-label">City</span>
-                        <span class="city-filter-meta" id="cityFilterMeta"></span>
-                        <span class="city-filter-chevron" aria-hidden="true">▾</span>
+                        <span class="col-filter-label">Check-in</span>
+                        <span class="col-filter-meta" data-col-filter-meta="arrivalDate"></span>
                       </button>
-                      <div class="city-filter-panel" id="cityFilterPanel" hidden>
-                        <div class="city-filter-panel-top">
-                          <span class="city-filter-hint">Filter by city</span>
-                          <button type="button" class="city-filter-reset" id="cityFilterReset">Reset</button>
+                      <button type="button" class="sort-btn col-sort-btn" data-sort="arrivalDate" aria-label="Sort by check-in"></button>
+                      <div class="col-filter-panel" data-col-filter-panel="arrivalDate" hidden>
+                        <div class="col-filter-panel-top">
+                          <span class="col-filter-hint">Filter by check-in</span>
+                          <button type="button" class="col-filter-reset" data-col-filter-reset="arrivalDate">Reset</button>
                         </div>
-                        <div class="city-filter-list" id="cityFilterList"></div>
+                        <div class="col-filter-list" data-col-filter-list="arrivalDate"></div>
+                      </div>
+                    </div>
+                  </th>
+                  <th class="col-filter-th">
+                    <div class="col-filter">
+                      <button
+                        type="button"
+                        class="col-filter-trigger"
+                        data-col-filter="hotelName"
+                        aria-expanded="false"
+                        aria-haspopup="true"
+                      >
+                        <span class="col-filter-label">Hotel</span>
+                        <span class="col-filter-meta" data-col-filter-meta="hotelName"></span>
+                      </button>
+                      <button type="button" class="sort-btn col-sort-btn" data-sort="hotelName" aria-label="Sort by hotel"></button>
+                      <div class="col-filter-panel" data-col-filter-panel="hotelName" hidden>
+                        <div class="col-filter-panel-top">
+                          <span class="col-filter-hint">Filter by hotel</span>
+                          <button type="button" class="col-filter-reset" data-col-filter-reset="hotelName">Reset</button>
+                        </div>
+                        <div class="col-filter-list" data-col-filter-list="hotelName"></div>
+                      </div>
+                    </div>
+                  </th>
+                  <th class="col-filter-th">
+                    <div class="col-filter">
+                      <button
+                        type="button"
+                        class="col-filter-trigger"
+                        data-col-filter="brandCode"
+                        aria-expanded="false"
+                        aria-haspopup="true"
+                      >
+                        <span class="col-filter-label">Brand</span>
+                        <span class="col-filter-meta" data-col-filter-meta="brandCode"></span>
+                      </button>
+                      <button type="button" class="sort-btn col-sort-btn" data-sort="brandCode" aria-label="Sort by brand"></button>
+                      <div class="col-filter-panel" data-col-filter-panel="brandCode" hidden>
+                        <div class="col-filter-panel-top">
+                          <span class="col-filter-hint">Filter by brand</span>
+                          <button type="button" class="col-filter-reset" data-col-filter-reset="brandCode">Reset</button>
+                        </div>
+                        <div class="col-filter-list" data-col-filter-list="brandCode"></div>
+                      </div>
+                    </div>
+                  </th>
+                  <th class="col-filter-th">
+                    <div class="col-filter">
+                      <button
+                        type="button"
+                        class="col-filter-trigger"
+                        data-col-filter="city"
+                        aria-expanded="false"
+                        aria-haspopup="true"
+                      >
+                        <span class="col-filter-label">City</span>
+                        <span class="col-filter-meta" data-col-filter-meta="city"></span>
+                      </button>
+                      <button type="button" class="sort-btn col-sort-btn" data-sort="city" aria-label="Sort by city"></button>
+                      <div class="col-filter-panel" data-col-filter-panel="city" hidden>
+                        <div class="col-filter-panel-top">
+                          <span class="col-filter-hint">Filter by city</span>
+                          <button type="button" class="col-filter-reset" data-col-filter-reset="city">Reset</button>
+                        </div>
+                        <div class="col-filter-list" data-col-filter-list="city"></div>
                       </div>
                     </div>
                   </th>
                   <th><button type="button" class="sort-btn" data-sort="amount">Price</button></th>
                   <th><button type="button" class="sort-btn" data-sort="roomsAvail">Rooms</button></th>
-                  <th><button type="button" class="sort-btn" data-sort="specialRateType">Rate</button></th>
+                  <th class="col-filter-th">
+                    <div class="col-filter">
+                      <button
+                        type="button"
+                        class="col-filter-trigger"
+                        data-col-filter="specialRateType"
+                        aria-expanded="false"
+                        aria-haspopup="true"
+                      >
+                        <span class="col-filter-label">Rate</span>
+                        <span class="col-filter-meta" data-col-filter-meta="specialRateType"></span>
+                      </button>
+                      <button type="button" class="sort-btn col-sort-btn" data-sort="specialRateType" aria-label="Sort by rate"></button>
+                      <div class="col-filter-panel" data-col-filter-panel="specialRateType" hidden>
+                        <div class="col-filter-panel-top">
+                          <span class="col-filter-hint">Filter by rate</span>
+                          <button type="button" class="col-filter-reset" data-col-filter-reset="specialRateType">Reset</button>
+                        </div>
+                        <div class="col-filter-list" data-col-filter-list="specialRateType"></div>
+                      </div>
+                    </div>
+                  </th>
                   <th></th>
                 </tr>
               </thead>
