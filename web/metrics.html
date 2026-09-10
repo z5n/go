@@ -14,6 +14,7 @@
         </a>
         <nav class="nav-links">
           <a href="index.html">Search</a>
+          <a href="map.html">Map</a>
           <a class="active" href="metrics.html">Metrics</a>
           <a href="https://www.hilton.com/en/go-hilton/" target="_blank" rel="noopener">Go Portal</a>
         </nav>
@@ -23,9 +24,10 @@
         <section class="hero">
           <h1>Session metrics</h1>
           <p class="lede">
-            Outbound requests made while a go+ search page is open. Each open search tab is one session
-            with a unique Session ID you can copy and paste when debugging.
-            The last 20 sessions are saved locally and survive service worker restarts.
+            Full activity log for each open Search tab: outbound Hilton requests, messages,
+            destination lookups, scan progress, cache hits, stops, and errors. Copy a Session ID
+            when debugging. Export a session for the full uncapped activity log. The last 20
+            sessions are saved locally.
           </p>
         </section>
 
@@ -35,7 +37,7 @@
             <div class="metric-value" id="metricActive">0</div>
           </div>
           <div class="metric-card">
-            <div class="metric-label">Total requests</div>
+            <div class="metric-label">Activity events</div>
             <div class="metric-value" id="metricTotal">0</div>
           </div>
           <div class="metric-card">

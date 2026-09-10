@@ -18,6 +18,8 @@ import {
   setCachedShopRooms,
   deleteCachedShopRooms,
   listCachedCalendars,
+  listCachedMapHotels,
+  updateCachedHotelCoords,
   pruneStaleCache,
 } from "./rate-cache.js";
 import {
@@ -25,6 +27,7 @@ import {
   endMetricsSession,
   getMetricsSnapshot,
   runWithMetricsSession,
+  recordActivity,
 } from "./request-metrics.js";
 
 async function clearGuestSession() {
@@ -38,6 +41,85 @@ async function clearGuestSession() {
 
 async function clearUnauthorizedFlag() {
   await chrome.storage.local.remove(["sessionUnauthorized", "failedAccessTokenFingerprint"]);
+}
+
+const GEOCODE_CACHE_KEY = "mapGeocodeCache";
+
+async function geocodePlaceLabel(city, country) {
+  const label = [city, country].filter(Boolean).join(", ").trim();
+  if (!label) return null;
+  const cacheKey = label.toLowerCase();
+  try {
+    const stored = await chrome.storage.local.get(GEOCODE_CACHE_KEY);
+    const map = stored[GEOCODE_CACHE_KEY] || {};
+    if (map[cacheKey]?.lat != null && map[cacheKey]?.lon != null) {
+      return { lat: Number(map[cacheKey].lat), lon: Number(map[cacheKey].lon) };
+    }
+  } catch {
+    /* ignore */
+  }
+
+  const url = new URL("https://nominatim.openstreetmap.org/search");
+  url.searchParams.set("q", label);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("limit", "1");
+  const response = await fetch(url.toString(), {
+    headers: { Accept: "application/json", "User-Agent": "GoPlusCacheMap/0.1" },
+  });
+  if (!response.ok) return null;
+  const results = await response.json();
+  if (!results?.length) return null;
+  const hit = {
+    lat: Number(results[0].lat),
+    lon: Number(results[0].lon),
+  };
+  if (!Number.isFinite(hit.lat) || !Number.isFinite(hit.lon)) return null;
+  try {
+    const stored = await chrome.storage.local.get(GEOCODE_CACHE_KEY);
+    const map = { ...(stored[GEOCODE_CACHE_KEY] || {}), [cacheKey]: hit };
+    // Cap cache size.
+    const keys = Object.keys(map);
+    if (keys.length > 500) {
+      for (const k of keys.slice(0, keys.length - 500)) delete map[k];
+    }
+    await chrome.storage.local.set({ [GEOCODE_CACHE_KEY]: map });
+  } catch {
+    /* ignore */
+  }
+  return hit;
+}
+
+/** Hotels for the coverage map; backfill a few missing coords from city/country. */
+async function buildCacheMapHotels() {
+  const hotels = await listCachedMapHotels({ includeStale: true });
+  const needGeo = hotels.filter(
+    (h) => (h.lat == null || h.lon == null) && (h.city || h.country)
+  );
+  const byLabel = new Map();
+  for (const h of needGeo) {
+    const label = [h.city, h.country].filter(Boolean).join(", ");
+    if (!byLabel.has(label)) byLabel.set(label, []);
+    byLabel.get(label).push(h);
+  }
+  let i = 0;
+  for (const [, group] of byLabel) {
+    if (i >= 5) break;
+    try {
+      if (i > 0) await new Promise((r) => setTimeout(r, 1100));
+      i += 1;
+      const hit = await geocodePlaceLabel(group[0].city, group[0].country);
+      if (!hit) continue;
+      for (const h of group) {
+        h.lat = hit.lat;
+        h.lon = hit.lon;
+        h.coordsSource = "geocode";
+        updateCachedHotelCoords(h.ctyhocn, hit.lat, hit.lon).catch(() => {});
+      }
+    } catch {
+      /* skip label */
+    }
+  }
+  return hotels;
 }
 
 function extractGuestId(text) {
@@ -90,19 +172,57 @@ async function getGuestId() {
   return syncGuestIdFromCookies();
 }
 
-function monthStarts(fromDate, toDate) {
-  const start = new Date(`${fromDate}T00:00:00`);
-  const end = new Date(`${toDate}T00:00:00`);
-  const months = [];
-  let cursor = new Date(start.getFullYear(), start.getMonth(), 1);
-  const last = new Date(end.getFullYear(), end.getMonth(), 1);
-  while (cursor <= last) {
-    const y = cursor.getFullYear();
-    const m = String(cursor.getMonth() + 1).padStart(2, "0");
-    months.push(`${y}-${m}-01`);
-    cursor.setMonth(cursor.getMonth() + 1);
+function dateOnly(iso) {
+  const s = String(iso || "");
+  return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : s;
+}
+
+function nightsBetweenISO(fromDate, toDate) {
+  const from = new Date(`${dateOnly(fromDate)}T00:00:00`);
+  const to = new Date(`${dateOnly(toDate)}T00:00:00`);
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return 1;
+  return Math.max(1, Math.round((to.getTime() - from.getTime()) / 86400000));
+}
+
+function normalizeScanRanges(message = {}) {
+  const raw = Array.isArray(message.ranges)
+    ? message.ranges
+    : Array.isArray(message.stays)
+      ? message.stays
+      : [];
+  const mapped = raw
+    .map((r) => {
+      let from = dateOnly(r?.from || r?.fromDate || "");
+      let to = dateOnly(r?.to || r?.toDate || "");
+      if (!from) return null;
+      if (!to) to = addDaysISO(from, 1);
+      if (to < from) {
+        const tmp = from;
+        from = to;
+        to = tmp;
+      }
+      if (to === from) to = addDaysISO(from, 1);
+      return {
+        fromDate: from,
+        toDate: to,
+        // Always derive from dates — never trust a stale nights field.
+        nights: nightsBetweenISO(from, to),
+      };
+    })
+    .filter(Boolean);
+  if (mapped.length) return mapped;
+  if (message.fromDate) {
+    let from = dateOnly(message.fromDate);
+    let to = dateOnly(message.toDate) || addDaysISO(from, Number(message.nights) || 1);
+    if (to < from) {
+      const tmp = from;
+      from = to;
+      to = tmp;
+    }
+    if (to === from) to = addDaysISO(from, 1);
+    return [{ fromDate: from, toDate: to, nights: nightsBetweenISO(from, to) }];
   }
-  return months;
+  return [];
 }
 
 function addDaysISO(iso, days) {
@@ -124,7 +244,37 @@ function sortScanRows(rows) {
   });
 }
 
-function emitScanProgress({ done, total, hotel, rows, fromCache = false, cacheHits = 0 }) {
+function emitScanProgress({
+  done,
+  total,
+  hotel,
+  rows,
+  fromCache = false,
+  cacheHits = 0,
+  hotelCount = 0,
+  unauthorized = false,
+}) {
+  const matchRows = (rows || []).filter((r) => !r.error);
+  const errorRows = (rows || []).filter((r) => r.error);
+  recordActivity({
+    type: "scan",
+    name: unauthorized ? "progress_unauthorized" : "progress",
+    ok: !unauthorized,
+    error: unauthorized ? "unauthorized" : null,
+    detail: {
+      done,
+      total,
+      hotel: hotel || null,
+      hotelCount,
+      matches: matchRows.length,
+      matchHotels: new Set(matchRows.map((r) => String(r.ctyhocn || "").toUpperCase()).filter(Boolean))
+        .size,
+      errors: errorRows.length,
+      cacheHits,
+      fromCache: Boolean(fromCache),
+      cachedMatches: matchRows.filter((r) => r.fromCache).length,
+    },
+  });
   chrome.runtime
     .sendMessage({
       type: "SCAN_PROGRESS",
@@ -133,8 +283,10 @@ function emitScanProgress({ done, total, hotel, rows, fromCache = false, cacheHi
       hotel,
       fromCache,
       cacheHits,
+      hotelCount,
+      unauthorized,
       rows: sortScanRows(rows),
-      matches: rows.filter((r) => !r.error).length,
+      matches: matchRows.length,
     })
     .catch(() => {});
 }
@@ -164,6 +316,7 @@ chrome.action.onClicked.addListener(async (tab) => {
 let scanCancelled = false;
 
 function buildCachedScanRows(entries, {
+  ranges = [],
   fromDate = null,
   toDate = null,
   nights = null,
@@ -171,10 +324,13 @@ function buildCachedScanRows(entries, {
   maxRate,
   minRooms,
 }) {
-  const from = fromDate ? new Date(`${fromDate}T00:00:00`) : null;
-  const to = toDate ? new Date(`${toDate}T00:00:00`) : null;
+  const scanRanges = ranges?.length
+    ? ranges
+    : fromDate
+      ? normalizeScanRanges({ fromDate, toDate, nights })
+      : [];
   const rows = [];
-  const seenHotels = new Set();
+  const matchedHotels = new Set();
   let cacheHits = 0;
 
   // Prefer a real hotel name from any cache entry for the same ctyhocn — refreshes
@@ -199,21 +355,60 @@ function buildCachedScanRows(entries, {
     if (scanCancelled) break;
     cacheHits += 1;
     const hotelCtyhocn = String(entry.calendar?.ctyhocn || entry.ctyhocn || "").toUpperCase();
-    if (hotelCtyhocn) seenHotels.add(hotelCtyhocn);
     const meta = metaByCtyhocn.get(hotelCtyhocn) || {};
     const entryNights = Number(entry.nights) || 1;
     for (const day of entry.calendar?.days || []) {
       if (day.amount == null) continue;
       const arrival = day.arrivalDate;
       if (!arrival) continue;
-      const d = new Date(`${arrival}T00:00:00`);
-      if (from && d < from) continue;
-      if (to && d > to) continue;
       if (goOnly && !day.isGoRate) continue;
       if (maxRate != null && day.amount > maxRate) continue;
       if ((day.roomsAvail ?? 0) < minRooms) continue;
-      const stayNights = nights == null ? entryNights : Number(nights) || entryNights;
+      if (scanRanges.length) {
+        const arrivalDay = String(arrival).slice(0, 10);
+        const match = scanRanges.find(
+          (r) =>
+            String(r.fromDate).slice(0, 10) === arrivalDay &&
+            Number(r.nights) === entryNights
+        );
+        if (!match) continue;
+        const departureDate = match.toDate;
+        if (hotelCtyhocn) matchedHotels.add(hotelCtyhocn);
+        rows.push({
+          arrivalDate: arrivalDay,
+          departureDate,
+          amount: day.amount,
+          amountFmt: day.amountFmt,
+          currency: day.currency,
+          roomsAvail: day.roomsAvail,
+          ratePlanCode: day.ratePlanCode,
+          roomTypeCode: day.roomTypeCode,
+          ratePlanName: day.ratePlanName,
+          ratePlanDesc: day.ratePlanDesc,
+          specialRateType: day.specialRateType,
+          isGoRate: day.isGoRate,
+          amountOriginal: day.amountOriginal,
+          currencyOriginal: day.currencyOriginal,
+          fxRateToUsd: day.fxRateToUsd,
+          hotelName: meta.hotelName || entry.hotelName || hotelCtyhocn,
+          brandCode: meta.brandCode || entry.brandCode || null,
+          city: meta.city || entry.city || null,
+          country: meta.country || entry.country || null,
+          ctyhocn: hotelCtyhocn,
+          nights: match.nights,
+          fromCache: true,
+          fetchedAt: entry.fetchedAt || null,
+          bookUrl: `https://www.hilton.com/en/book/reservation/rooms/?ctyhocn=${encodeURIComponent(
+            hotelCtyhocn
+          )}&arrivalDate=${encodeURIComponent(arrivalDay)}&departureDate=${encodeURIComponent(
+            departureDate
+          )}&room1NumAdults=1`,
+        });
+        continue;
+      }
+      const stayNights = entryNights;
       const departureDate = addDaysISO(arrival, stayNights);
+      if (hotelCtyhocn) matchedHotels.add(hotelCtyhocn);
       rows.push({
         ...day,
         arrivalDate: arrival,
@@ -235,64 +430,128 @@ function buildCachedScanRows(entries, {
     }
   }
 
-  return { rows: sortScanRows(rows), cacheHits, hotelsCached: seenHotels.size };
+  return { rows: sortScanRows(rows), cacheHits, hotelsCached: matchedHotels.size };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    const msgType = String(message?.type || "unknown");
+    const sessionId = message?.sessionId || null;
+
     // Handle cache-only search outside the metrics wrapper so it can't be
     // dropped by nested handler braces / session bookkeeping.
     if (message?.type === "SCAN_CACHED_RATES") {
-      scanCancelled = false;
-      pruneStaleCache().catch(() => {});
-      const {
-        fromDate = null,
-        toDate = null,
-        nights = null,
-        friendsAndFamily = true,
-        goOnly = true,
-        maxRate = null,
-        minRooms = 1,
-      } = message;
-      try {
-        const guestId = await getGuestId();
-        const nightsFilter =
-          nights == null || nights === "" || Number.isNaN(Number(nights))
-            ? null
-            : Number(nights);
-        const entries = await listCachedCalendars({
-          nights: nightsFilter,
-          friendsAndFamily,
-          guestId,
+      await runWithMetricsSession(sessionId, async () => {
+        recordActivity({
+          type: "message",
+          name: "SCAN_CACHED_RATES",
+          detail: {
+            ranges: message.ranges,
+            ctyhocn: message.ctyhocn || null,
+            goOnly: message.goOnly,
+            maxRate: message.maxRate,
+            minRooms: message.minRooms,
+          },
         });
-        const { rows, cacheHits, hotelsCached } = buildCachedScanRows(entries, {
-          fromDate: fromDate || null,
-          toDate: toDate || null,
-          nights: nightsFilter,
-          goOnly,
-          maxRate,
-          minRooms,
-        });
-        const cancelled = scanCancelled;
         scanCancelled = false;
-        sendResponse({
-          ok: true,
-          rows,
-          guestId,
-          cancelled,
-          done: cacheHits,
-          total: cacheHits,
-          cacheHits,
-          hotelsCached,
-        });
-      } catch (err) {
-        scanCancelled = false;
-        sendResponse({ ok: false, error: String(err?.message || err) });
-      }
+        pruneStaleCache().catch(() => {});
+        const {
+          fromDate = null,
+          toDate = null,
+          ranges = null,
+          friendsAndFamily = true,
+          goOnly = true,
+          maxRate = null,
+          minRooms = 1,
+          ctyhocn = null,
+        } = message;
+        try {
+          const guestId = await getGuestId();
+          const scanRanges = normalizeScanRanges({ ranges, fromDate, toDate });
+          const uniqueNights = [...new Set(scanRanges.map((r) => Number(r.nights)))];
+          const nightsFilter = uniqueNights.length === 1 ? uniqueNights[0] : null;
+          let entries = await listCachedCalendars({
+            nights: nightsFilter,
+            friendsAndFamily,
+            guestId,
+          });
+          const hotelCode = String(ctyhocn || "").toUpperCase();
+          if (hotelCode) {
+            entries = entries.filter(
+              (e) =>
+                String(e.ctyhocn || e.calendar?.ctyhocn || "").toUpperCase() === hotelCode
+            );
+          }
+          const { rows, cacheHits, hotelsCached } = buildCachedScanRows(entries, {
+            ranges: scanRanges,
+            goOnly,
+            maxRate,
+            minRooms,
+          });
+          const cancelled = scanCancelled;
+          scanCancelled = false;
+          recordActivity({
+            type: "scan",
+            name: "cached_done",
+            ok: true,
+            detail: {
+              matches: rows.filter((r) => !r.error).length,
+              cacheHits,
+              hotelsCached,
+              cancelled,
+            },
+          });
+          sendResponse({
+            ok: true,
+            rows,
+            guestId,
+            cancelled,
+            done: cacheHits,
+            total: cacheHits,
+            cacheHits,
+            hotelsCached,
+          });
+        } catch (err) {
+          scanCancelled = false;
+          recordActivity({
+            type: "scan",
+            name: "cached_error",
+            ok: false,
+            error: String(err?.message || err),
+          });
+          sendResponse({ ok: false, error: String(err?.message || err) });
+        }
+      });
       return;
     }
 
-    await runWithMetricsSession(message?.sessionId || null, async () => {
+    await runWithMetricsSession(sessionId, async () => {
+      // Skip logging noisy metrics polling / session bookkeeping chatter.
+      if (
+        msgType !== "GET_METRICS" &&
+        msgType !== "METRICS_SESSION_START" &&
+        msgType !== "METRICS_SESSION_END" &&
+        msgType !== "LOOKUP_CACHED_ROOM_RATES"
+      ) {
+        recordActivity({
+          type: "message",
+          name: msgType,
+          detail: {
+            fromTab: sender?.tab?.id ?? null,
+            destination: message?.destination || null,
+            hotelCount: Array.isArray(message?.hotels) ? message.hotels.length : undefined,
+            ranges: message?.ranges,
+            ctyhocn: message?.ctyhocn || null,
+            query: message?.query || null,
+            delayMs: message?.delayMs,
+            goOnly: message?.goOnly,
+            maxRate: message?.maxRate,
+            minRooms: message?.minRooms,
+            friendsAndFamily: message?.friendsAndFamily,
+          },
+        });
+      }
+
       if (message?.type === "METRICS_SESSION_START") {
         const snap = await startMetricsSession(message.sessionId);
         sendResponse({ ok: true, session: snap });
@@ -307,6 +566,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       if (message?.type === "GET_METRICS") {
         sendResponse({ ok: true, ...(await getMetricsSnapshot(message.sessionId || null)) });
+        return;
+      }
+
+      if (message?.type === "GET_CACHE_MAP") {
+        const hotels = await buildCacheMapHotels();
+        sendResponse({
+          ok: true,
+          hotels,
+          withCoords: hotels.filter((h) => h.lat != null && h.lon != null).length,
+          missingCoords: hotels.filter((h) => h.lat == null || h.lon == null).length,
+          entries: hotels.reduce((n, h) => n + (h.entries || 0), 0),
+        });
         return;
       }
 
@@ -386,6 +657,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       if (message?.type === "STOP_SCAN") {
         scanCancelled = true;
+        recordActivity({ type: "scan", name: "stop_requested" });
         sendResponse({ ok: true, stopped: true });
         return;
       }
@@ -418,17 +690,53 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (message?.type === "SEARCH_DESTINATION_HOTELS") {
-      scanCancelled = false;
-      const result = await searchHotelsNearDestination(message.destination, {
-        suggestion: message.suggestion || null,
-      });
-      if (scanCancelled) {
-        sendResponse({ ok: true, ...result, cancelled: true });
+        scanCancelled = false;
+        recordActivity({
+          type: "search",
+          name: "destination_start",
+          detail: {
+            destination: message.destination || null,
+            suggestionType: message.suggestion?.type || null,
+            suggestionLabel: message.suggestion?.label || message.suggestion?.primary || null,
+          },
+        });
+        try {
+          const result = await searchHotelsNearDestination(message.destination, {
+            suggestion: message.suggestion || null,
+          });
+          const hotels = result?.hotels || [];
+          recordActivity({
+            type: "search",
+            name: scanCancelled ? "destination_cancelled" : "destination_done",
+            ok: true,
+            detail: {
+              hotelCount: hotels.length,
+              place: result?.place?.displayName || null,
+              source: result?.source || null,
+              cancelled: Boolean(scanCancelled),
+              sample: hotels.slice(0, 8).map((h) => ({
+                ctyhocn: h.ctyhocn,
+                name: h.name,
+                city: h.city,
+              })),
+            },
+          });
+          if (scanCancelled) {
+            sendResponse({ ok: true, ...result, cancelled: true });
+            return;
+          }
+          sendResponse({ ok: true, ...result });
+        } catch (err) {
+          recordActivity({
+            type: "search",
+            name: "destination_error",
+            ok: false,
+            error: String(err?.message || err),
+          });
+          throw err;
+        }
         return;
       }
-      sendResponse({ ok: true, ...result });
-      return;
-    }
 
     if (message?.type === "FETCH_INVENTORY_RATES") {
       const {
@@ -477,6 +785,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
+    if (message?.type === "LOOKUP_CACHED_ROOM_RATES") {
+      const stays = Array.isArray(message.stays) ? message.stays.slice(0, 500) : [];
+      const guestId = await getGuestId();
+      const results = [];
+      for (const stay of stays) {
+        const ctyhocn = stay?.ctyhocn;
+        const arrivalDate = stay?.arrivalDate;
+        const departureDate = stay?.departureDate;
+        if (!ctyhocn || !arrivalDate || !departureDate) {
+          results.push({ rooms: [], cacheMiss: true });
+          continue;
+        }
+        const payload = await getCachedShopRooms({
+          ctyhocn,
+          arrivalDate,
+          departureDate,
+          friendsAndFamily: stay.friendsAndFamily !== false,
+          guestId,
+          currency: "USD",
+        });
+        if (!payload) {
+          results.push({ rooms: [], cacheMiss: true });
+          continue;
+        }
+        results.push({
+          rooms: payload.rooms || [],
+          currency: payload.currency || null,
+          fromCache: true,
+        });
+      }
+      sendResponse({ ok: true, results });
+      return;
+    }
+
     if (message?.type === "FETCH_ROOM_RATES") {
       const {
         ctyhocn,
@@ -500,6 +842,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       let payload = await getCachedShopRooms(cacheParams);
       let fromCache = Boolean(payload);
       if (!payload) {
+        if (message.cacheOnly) {
+          sendResponse({ ok: true, rooms: [], fromCache: false, cacheMiss: true });
+          return;
+        }
         try {
           payload = await fetchShopRooms({
             ctyhocn,
@@ -519,7 +865,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             });
             return;
           }
-          throw err;
+          sendResponse({
+            ok: false,
+            error: String(err?.message || err || "Room shop failed."),
+          });
+          return;
         }
       }
       sendResponse({
@@ -544,6 +894,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         brandCode = null,
         city = null,
         country = null,
+        lat = null,
+        lon = null,
       } = message;
       if (!ctyhocn || !arrivalDate) {
         sendResponse({ ok: false, error: "Missing stay details to refresh." });
@@ -577,6 +929,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             brandCode: brandCode || null,
             city: city || null,
             country: country || null,
+            lat: lat ?? null,
+            lon: lon ?? null,
           },
           calendar
         );
@@ -671,7 +1025,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         hotels,
         fromDate,
         toDate,
-        nights = 1,
+        ranges = null,
         friendsAndFamily = true,
         goOnly = true,
         maxRate = null,
@@ -680,127 +1034,187 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       } = message;
 
       const guestId = await getGuestId();
-      const months = monthStarts(fromDate, toDate);
-      const from = new Date(`${fromDate}T00:00:00`);
-      const to = new Date(`${toDate}T00:00:00`);
+      const scanRanges = normalizeScanRanges({ ranges, fromDate, toDate });
+      if (!scanRanges.length) {
+        recordActivity({
+          type: "scan",
+          name: "rates_error",
+          ok: false,
+          error: "At least one stay is required",
+        });
+        sendResponse({ ok: false, error: "At least one stay is required" });
+        return;
+      }
+      const tooLong = scanRanges.find((r) => r.nights > 7);
+      if (tooLong) {
+        const err = `Stays can be at most 7 nights (got ${tooLong.nights} for ${tooLong.fromDate} → ${tooLong.toDate}).`;
+        recordActivity({ type: "scan", name: "rates_error", ok: false, error: err });
+        sendResponse({ ok: false, error: err });
+        return;
+      }
+
+      // One calendar fetch per hotel × stay (month + length of stay).
+      const jobs = [];
+      for (const hotel of hotels || []) {
+        for (const stay of scanRanges) {
+          jobs.push({
+            hotel,
+            stay,
+            monthArrival: `${String(stay.fromDate).slice(0, 7)}-01`,
+          });
+        }
+      }
       const rows = [];
       let done = 0;
       let cacheHits = 0;
-      const total = hotels.length * months.length;
+      const total = jobs.length;
+      const hotelCount = (hotels || []).length;
 
-      outer: for (const hotel of hotels) {
-        for (const arrivalDate of months) {
-          if (scanCancelled) break outer;
-          const cacheParams = {
-            ctyhocn: hotel.ctyhocn,
-            arrivalDate,
-            nights,
-            friendsAndFamily,
-            guestId,
-            currency: "USD",
-          };
-          let fromCache = false;
-          try {
-            let calendar = await getCachedCalendar(cacheParams);
-            if (calendar) {
-              fromCache = true;
-              cacheHits += 1;
-            } else {
-              calendar = await fetchCalendar({
-                ctyhocn: hotel.ctyhocn,
-                arrivalDate,
-                lengthOfStay: nights,
-                friendsAndFamily,
-                guestId,
-              });
-              await setCachedCalendar(
-                {
-                  ...cacheParams,
-                  hotelName: hotel.name || null,
-                  brandCode: hotel.brandCode || null,
-                  city: hotel.city || null,
-                  country: hotel.country || null,
-                },
-                calendar
-              );
-            }
+      recordActivity({
+        type: "scan",
+        name: "rates_start",
+        detail: {
+          hotelCount,
+          stayCount: scanRanges.length,
+          jobs: total,
+          goOnly,
+          maxRate,
+          minRooms,
+          delayMs,
+          ranges: scanRanges,
+        },
+      });
 
-            for (const day of calendar.days || []) {
-              if (day.amount == null) continue;
-              const arrival = day.arrivalDate;
-              const d = new Date(`${arrival}T00:00:00`);
-              // From/To = allowed check-in dates (inclusive). Stay length = nights.
-              if (d < from || d > to) continue;
-              if (goOnly && !day.isGoRate) continue;
-              if (maxRate != null && day.amount > maxRate) continue;
-              if ((day.roomsAvail ?? 0) < minRooms) continue;
-              const departureDate = addDaysISO(arrival, nights);
-              const ctyhocn = calendar.ctyhocn || hotel.ctyhocn;
-              rows.push({
-                ...day,
-                arrivalDate: arrival,
-                departureDate,
-                hotelName: hotel.name,
-                brandCode: hotel.brandCode,
-                city: hotel.city,
-                country: hotel.country,
-                ctyhocn,
-                nights,
-                fromCache,
-                fetchedAt: fromCache ? calendar.fetchedAt || null : null,
-                bookUrl: `https://www.hilton.com/en/book/reservation/rooms/?ctyhocn=${encodeURIComponent(
-                  ctyhocn
-                )}&arrivalDate=${encodeURIComponent(arrival)}&departureDate=${encodeURIComponent(
-                  departureDate
-                )}&room1NumAdults=1`,
-              });
-            }
-          } catch (err) {
-            if (isUnauthorizedError(err)) {
-              await clearGuestSession();
-              emitScanProgress({
-                done,
-                total,
-                hotel: hotel.name,
-                rows,
-                fromCache,
-                cacheHits,
-                unauthorized: true,
-              });
-              scanCancelled = false;
-              sendResponse({
-                ok: false,
-                unauthorized: true,
-                error: "Hilton session expired. Sign in again to continue.",
-                rows: sortScanRows(rows),
-                guestId: null,
-                cancelled: false,
-                done,
-                total,
-                cacheHits,
-              });
-              return;
-            }
-            rows.push({
-              error: true,
+      outer: for (const job of jobs) {
+        if (scanCancelled) break outer;
+        const { hotel, stay, monthArrival } = job;
+        const nights = Math.max(1, Number(stay.nights) || nightsBetweenISO(stay.fromDate, stay.toDate));
+        const checkIn = dateOnly(stay.fromDate);
+        const checkOut = dateOnly(stay.toDate) || addDaysISO(checkIn, nights);
+        const cacheParams = {
+          ctyhocn: hotel.ctyhocn,
+          arrivalDate: monthArrival,
+          nights,
+          friendsAndFamily,
+          guestId,
+          currency: "USD",
+        };
+        let fromCache = false;
+        try {
+          let calendar = await getCachedCalendar(cacheParams);
+          if (calendar) {
+            fromCache = true;
+            cacheHits += 1;
+          } else {
+            calendar = await fetchCalendar({
               ctyhocn: hotel.ctyhocn,
+              arrivalDate: monthArrival,
+              lengthOfStay: nights,
+              friendsAndFamily,
+              guestId,
+            });
+            await setCachedCalendar(
+              {
+                ...cacheParams,
+                hotelName: hotel.name || null,
+                brandCode: hotel.brandCode || null,
+                city: hotel.city || null,
+                country: hotel.country || null,
+                lat: hotel.lat ?? null,
+                lon: hotel.lon ?? null,
+              },
+              calendar
+            );
+          }
+
+          for (const day of calendar.days || []) {
+            if (day.amount == null) continue;
+            const arrival = dateOnly(day.arrivalDate);
+            // Exact stay: check-in must match this range's start.
+            if (arrival !== checkIn) continue;
+            if (goOnly && !day.isGoRate) continue;
+            if (maxRate != null && day.amount > maxRate) continue;
+            if ((day.roomsAvail ?? 0) < minRooms) continue;
+            const departureDate = checkOut;
+            const ctyhocn = calendar.ctyhocn || hotel.ctyhocn;
+            rows.push({
+              arrivalDate: arrival,
+              departureDate,
+              amount: day.amount,
+              amountFmt: day.amountFmt,
+              currency: day.currency,
+              roomsAvail: day.roomsAvail,
+              ratePlanCode: day.ratePlanCode,
+              roomTypeCode: day.roomTypeCode,
+              ratePlanName: day.ratePlanName,
+              ratePlanDesc: day.ratePlanDesc,
+              specialRateType: day.specialRateType,
+              isGoRate: day.isGoRate,
+              amountOriginal: day.amountOriginal,
+              currencyOriginal: day.currencyOriginal,
+              fxRateToUsd: day.fxRateToUsd,
               hotelName: hotel.name,
-              arrivalDate,
-              message: String(err.message || err),
+              brandCode: hotel.brandCode,
+              city: hotel.city,
+              country: hotel.country,
+              ctyhocn,
+              nights,
+              fromCache,
+              fetchedAt: fromCache ? calendar.fetchedAt || null : null,
+              bookUrl: `https://www.hilton.com/en/book/reservation/rooms/?ctyhocn=${encodeURIComponent(
+                ctyhocn
+              )}&arrivalDate=${encodeURIComponent(arrival)}&departureDate=${encodeURIComponent(
+                departureDate
+              )}&room1NumAdults=1`,
             });
           }
-          done += 1;
-          emitScanProgress({
-            done,
-            total,
-            hotel: hotel.name,
-            rows,
-            fromCache,
-            cacheHits,
+        } catch (err) {
+          if (isUnauthorizedError(err)) {
+            await clearGuestSession();
+            emitScanProgress({
+              done,
+              total,
+              hotel: hotel.name,
+              rows,
+              fromCache,
+              cacheHits,
+              hotelCount,
+              unauthorized: true,
+            });
+            scanCancelled = false;
+            sendResponse({
+              ok: false,
+              unauthorized: true,
+              error: "Hilton session expired. Sign in again to continue.",
+              rows: sortScanRows(rows),
+              guestId: null,
+              cancelled: false,
+              done,
+              total,
+              cacheHits,
+            });
+            return;
+          }
+          rows.push({
+            error: true,
+            ctyhocn: hotel.ctyhocn,
+            hotelName: hotel.name,
+            arrivalDate: stay.fromDate,
+            message: String(err.message || err),
           });
-          if (scanCancelled) break outer;
-          if (!fromCache) await new Promise((r) => setTimeout(r, delayMs));
         }
+        done += 1;
+        emitScanProgress({
+          done,
+          total,
+          hotel: hotel.name,
+          rows,
+          fromCache,
+          cacheHits,
+          hotelCount,
+        });
+        if (scanCancelled) break outer;
+        if (!fromCache) await new Promise((r) => setTimeout(r, delayMs));
       }
 
       const cancelled = scanCancelled;
@@ -809,8 +1223,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const unauthorizedRows = rows.filter(
         (r) => r.error && /unauthorized/i.test(String(r.message || ""))
       );
+      const matchRows = rows.filter((r) => !r.error);
+      const errorRows = rows.filter((r) => r.error);
       if (unauthorizedRows.length) {
         await clearGuestSession();
+        recordActivity({
+          type: "scan",
+          name: "rates_unauthorized",
+          ok: false,
+          error: "unauthorized",
+          detail: { done, total, cacheHits, matches: matchRows.length, errors: errorRows.length },
+        });
         sendResponse({
           ok: false,
           unauthorized: true,
@@ -826,6 +1249,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       await clearUnauthorizedFlag();
+      recordActivity({
+        type: "scan",
+        name: cancelled ? "rates_cancelled" : "rates_done",
+        ok: true,
+        detail: {
+          done,
+          total,
+          cacheHits,
+          matches: matchRows.length,
+          matchHotels: new Set(matchRows.map((r) => String(r.ctyhocn || "").toUpperCase()).filter(Boolean))
+            .size,
+          errors: errorRows.length,
+          cancelled,
+          errorSamples: errorRows.slice(0, 8).map((r) => ({
+            hotel: r.hotelName || r.ctyhocn,
+            arrivalDate: r.arrivalDate,
+            message: r.message,
+          })),
+        },
+      });
       sendResponse({
         ok: true,
         rows: sortScanRows(rows),
@@ -841,6 +1284,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ ok: false, error: "Unknown message" });
     });
   })().catch(async (err) => {
+    recordActivity({
+      type: "error",
+      name: "handler",
+      ok: false,
+      error: String(err?.message || err),
+      sessionId: message?.sessionId || null,
+      detail: { messageType: message?.type || null },
+    });
     if (isUnauthorizedError(err)) {
       await clearGuestSession();
       sendResponse({

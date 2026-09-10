@@ -5,6 +5,10 @@
 
 import { recordOutbound } from "./request-metrics.js";
 import { convertToUsd } from "./exchange-rates.js";
+import {
+  SHOP_PROP_AVAIL_OPERATION,
+  SHOP_PROP_AVAIL_QUERY,
+} from "./shop-prop-avail-query.js";
 
 const CALENDAR_QUERY = `query hotel_shopAvailOptions_shopCalendarPropAvail($arrivalDate: String!, $ctyhocn: String!, $language: String!, $guestLocationCountry: String, $numAdults: Int!, $numChildren: Int!, $numRooms: Int!, $displayCurrency: String, $lengthOfStay: Int!, $guestId: BigInt, $specialRates: ShopSpecialRateInput, $rateCategoryTokens: [String], $ratePlanCodes: [String], $childAges: [Int], $modifyingReservation: Boolean, $programAccountId: BigInt) {
   hotel(ctyhocn: $ctyhocn, language: $language) {
@@ -46,54 +50,8 @@ const CALENDAR_QUERY = `query hotel_shopAvailOptions_shopCalendarPropAvail($arri
   }
 }`;
 
-const SHOP_AVAIL_QUERY = `query hotel_shopAvailOptions_shopAvailProp($arrivalDate: String!, $departureDate: String!, $ctyhocn: String!, $language: String!, $guestLocationCountry: String, $numAdults: Int!, $numChildren: Int!, $numRooms: Int!, $displayCurrency: String, $guestId: BigInt, $specialRates: ShopSpecialRateInput, $rateCategoryTokens: [String], $ratePlanCodes: [String], $childAges: [Int], $modifyingReservation: Boolean, $programAccountId: BigInt) {
-  hotel(ctyhocn: $ctyhocn, language: $language) {
-    ctyhocn
-    shopAvail(
-      input: {
-        guestLocationCountry: $guestLocationCountry
-        arrivalDate: $arrivalDate
-        departureDate: $departureDate
-        displayCurrency: $displayCurrency
-        numAdults: $numAdults
-        numChildren: $numChildren
-        numRooms: $numRooms
-        guestId: $guestId
-        specialRates: $specialRates
-        rateCategoryTokens: $rateCategoryTokens
-        ratePlanCodes: $ratePlanCodes
-        childAges: $childAges
-        modifyingReservation: $modifyingReservation
-        programAccountId: $programAccountId
-      }
-    ) {
-      statusCode
-      currencyCode
-      roomTypes {
-        roomTypeCode
-        roomTypeName
-        roomTypeDesc
-        numBeds
-        smokingRoom
-        adaAccessibleRoom
-      }
-      roomRates {
-        numRoomsAvail
-        rateAmount(strategy: ceiling)
-        rateAmountFmt(decimal: 0, strategy: ceiling)
-        averageRate
-        amountAfterTax
-        ratePlanCode
-        roomTypeCode
-        ratePlan {
-          ratePlanName
-          ratePlanDesc
-          specialRateType
-        }
-      }
-    }
-  }
-}`;
+/** @type {{ appName: string, appVersion: string, query: string, operationName?: string } | null} */
+let shopAvailSuccessCombo = null;
 
 const GUEST_USERNAME_QUERY = `query guest($guestId: BigInt!, $language: String!) {
   guest(guestId: $guestId, language: $language) {
@@ -1001,8 +959,8 @@ function hasGraphqlData(data) {
 
 function defaultAppVersion(appName) {
   if (appName === "dx-go-hilton2-ui") return "dx-go-hilton2-ui:1013426";
-  // Calendar + most shop calls historically use this build id even when
-  // appName is dx-res-ui (Hilton's own traffic does the same mismatch).
+  if (appName === "dx-res-ui") return "dx-res-ui:1029006";
+  // Calendar + search still often use shop-search build id.
   return "dx-shop-search-ui:1030775";
 }
 
@@ -1066,22 +1024,70 @@ function shopAvailClientAttempts(discovered = []) {
     if (ver.startsWith("dx-res-ui:")) push("dx-res-ui", ver);
     if (ver.startsWith("dx-shop-search-ui:")) {
       push("dx_shop_search_app", ver);
-      // Historical go+ combo that calendar still uses.
       push("dx-res-ui", ver);
     }
     if (ver.startsWith("dx-go-hilton2-ui:")) push("dx-go-hilton2-ui", ver);
+    if (ver.startsWith("dx-ohw-ui:")) push("dx-ohw-ui", ver);
   }
 
-  // Stable fallbacks (matched appName/appVersion prefixes first).
+  // Live rooms UI (2026) — shopPropAvail allowlist.
+  push("dx-res-ui", "dx-res-ui:1029006");
   push("dx-res-ui", "dx-res-ui:1030775");
-  push("dx_shop_search_app", "dx-shop-search-ui:1030775");
   push("dx-res-ui", "dx-shop-search-ui:1030775");
-  push("dx-go-hilton2-ui", "dx-go-hilton2-ui:1013426");
+  push("dx_shop_search_app", "dx-shop-search-ui:1030775");
   return attempts;
 }
 
 function isInvalidOperationNameError(errOrMessage) {
   return /invalid operation name/i.test(String(errOrMessage?.message || errOrMessage || ""));
+}
+
+/** Keep only variables declared in the query document. */
+function variablesForQuery(query, variables) {
+  const declared = new Set(
+    [...String(query || "").matchAll(/\$([A-Za-z_][A-Za-z0-9_]*)\s*:/g)].map((m) => m[1])
+  );
+  if (!declared.size) return variables;
+  const out = {};
+  for (const [key, value] of Object.entries(variables || {})) {
+    if (declared.has(key)) out[key] = value;
+  }
+  return out;
+}
+
+function newShopCacheId() {
+  try {
+    if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
+  } catch {
+    /* ignore */
+  }
+  return `goplus-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function loadShopAvailSuccessCombo() {
+  if (shopAvailSuccessCombo?.query?.includes("shopPropAvail")) return shopAvailSuccessCombo;
+  try {
+    const stored = await chrome.storage.local.get(["shopAvailSuccessCombo"]);
+    const combo = stored?.shopAvailSuccessCombo;
+    // Ignore stale shopAvailProp combos from before Hilton renamed the op.
+    if (combo?.query?.includes("shopPropAvail") && combo?.appName) {
+      shopAvailSuccessCombo = combo;
+      return combo;
+    }
+    if (combo) await chrome.storage.local.remove(["shopAvailSuccessCombo"]);
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+async function saveShopAvailSuccessCombo(combo) {
+  shopAvailSuccessCombo = combo;
+  try {
+    await chrome.storage.local.set({ shopAvailSuccessCombo: combo });
+  } catch {
+    /* ignore */
+  }
 }
 
 async function hiltonGraphql(
@@ -1282,8 +1288,12 @@ async function fetchAllHotelsForPlaceUri(placeUri, countryCode, { pageSize = 150
   return { hotels, interlinks };
 }
 
+function suggestionHasCity(match, resolved) {
+  return Boolean(match?.address?.city || resolved?.city);
+}
+
 function isCountryMatch(match, resolved, placeUri) {
-  if (isRegionSuggestion(resolved)) return false;
+  if (isRegionSuggestion(resolved) || suggestionHasCity(match, resolved)) return false;
   return (
     isCountrySuggestion(resolved) ||
     /country/i.test(String(match?.type || "")) ||
@@ -1294,14 +1304,16 @@ function isCountryMatch(match, resolved, placeUri) {
 /** State / province / island — not a country, not a city. */
 function isRegionMatch(match, resolved, placeUri) {
   if (isCountrySuggestion(resolved) || isCountryMatch(match, resolved, placeUri)) return false;
+  // Autocomplete "Bilbao, Basque Country, Spain" is a city even when Hilton's
+  // geocode placeUri is the parent subdivision (/en/locations/spain/basque-country/).
+  if (suggestionHasCity(match, resolved) && !isRegionSuggestion(resolved)) return false;
   if (isRegionSuggestion(resolved)) return true;
   const t = String(match?.type || "").toLowerCase();
   if (/(state|region|province|administrative)/i.test(t)) return true;
   // /en/locations/{country}/{subdivision}/
   if (placeUri && /^\/en\/locations\/[^/]+\/[^/]+\/$/.test(placeUri)) return true;
   const hasState = Boolean(match?.address?.state || match?.address?.stateName || resolved?.state);
-  const hasCity = Boolean(match?.address?.city || resolved?.city);
-  return hasState && !hasCity;
+  return hasState && !suggestionHasCity(match, resolved);
 }
 
 /**
@@ -1315,7 +1327,10 @@ async function fetchEntirePlaceInventory(match, resolved, countryCode) {
 
   let quadrantError = null;
   try {
-    const tiles = await fetchInventoryByQuadrants(match, countryCode, { isCountry });
+    const tiles = await fetchInventoryByQuadrants(match, countryCode, {
+      isCountry,
+      suggestion: resolved,
+    });
     if (tiles.hotels.length) {
       const source = tiles.failures
         ? `quadrants:${tiles.quadrants}+fails:${tiles.failures}`
@@ -1533,6 +1548,38 @@ function keepLeafQuadrants(ids) {
   return list.filter((id) => !list.some((other) => other !== id && other.startsWith(`${id}::`)));
 }
 
+/** Axis-aligned box covering a radius (km) around a lat/lon. */
+function boundsAroundPoint(lat, lon, km) {
+  if (lat == null || lon == null || !(km > 0)) return null;
+  const latPad = km / 111;
+  const cos = Math.cos((Number(lat) * Math.PI) / 180);
+  const lonPad = km / (111 * Math.max(0.2, Math.abs(cos)));
+  return {
+    northeast: { latitude: Number(lat) + latPad, longitude: Number(lon) + lonPad },
+    southwest: { latitude: Number(lat) - latPad, longitude: Number(lon) - lonPad },
+  };
+}
+
+function unionBounds(a, b) {
+  if (!a) return b || null;
+  if (!b) return a;
+  const ane = a.northeast;
+  const asw = a.southwest;
+  const bne = b.northeast;
+  const bsw = b.southwest;
+  if (!ane || !asw || !bne || !bsw) return a;
+  return {
+    northeast: {
+      latitude: Math.max(ane.latitude, bne.latitude),
+      longitude: Math.max(ane.longitude, bne.longitude),
+    },
+    southwest: {
+      latitude: Math.min(asw.latitude, bsw.latitude),
+      longitude: Math.min(asw.longitude, bsw.longitude),
+    },
+  };
+}
+
 /**
  * The quadrants hilton.com queries for a search: every tile covering the country
  * (or intersecting the geocoded bounds), one hotelSummaryOptions call each.
@@ -1573,12 +1620,27 @@ async function fetchQuadrantHotels(quadrantId, guestLocationCountry) {
  * Whole-place inventory the way the Go Hilton results page builds it: resolve the
  * quadrant tree once, then fan out one request per tile and merge on ctyhocn.
  */
-async function fetchInventoryByQuadrants(match, countryCode, { isCountry = false } = {}) {
+async function fetchInventoryByQuadrants(match, countryCode, { isCountry = false, suggestion = null } = {}) {
   const quadrants = await loadHotelQuadrants();
   const guestLocationCountry = asIso2CountryCode(countryCode) || "US";
+  // City geocode boxes are tight (historic center). Expand to the same metro
+  // radius we filter with so airport / suburb hotels land in inventory.
+  // Skip regions — their geocode bounds (or country tiles) already cover the area.
+  let bounds = match?.geometry?.bounds || null;
+  if (!isCountry && !isRegionSuggestion(suggestion)) {
+    const loc = match?.geometry?.location;
+    const radius = radiusKmForSuggestion(suggestion) ?? 40;
+    if (radius != null && radius <= 50) {
+      const around =
+        loc?.latitude != null && loc?.longitude != null
+          ? boundsAroundPoint(loc.latitude, loc.longitude, radius)
+          : null;
+      bounds = unionBounds(bounds, around) || around || bounds;
+    }
+  }
   const ids = selectSearchQuadrantIds(quadrants, {
     countryCode: guestLocationCountry,
-    bounds: match?.geometry?.bounds || null,
+    bounds,
     isCountry,
   });
   if (!ids.length) return { hotels: [], quadrants: 0, failures: 0, lastError: null };
@@ -1961,8 +2023,30 @@ function radiusKmForSuggestion(suggestion) {
   if (type === "poi") return 35;
   if (type === "country") return null; // full country inventory — no radius cut
   if (type === "region" || isRegionSuggestion(suggestion)) return 350;
-  // City / destination: match Go Hilton “place + nearby” (Malpensa, Monza, Como, …).
-  return 100;
+  // City metro: include airport / suburb hotels Go Hilton shows (e.g. Fiumicino
+  // for Rome) without reaching the next city (Bilbao → San Sebastián).
+  return 40;
+}
+
+function mergeHotelsByCtyhocn(...lists) {
+  const seen = new Set();
+  const out = [];
+  for (const list of lists) {
+    for (const h of list || []) {
+      if (!h?.ctyhocn || seen.has(h.ctyhocn)) continue;
+      seen.add(h.ctyhocn);
+      out.push(h);
+    }
+  }
+  return out;
+}
+
+/** Diagonal of Hilton geocode bounds — city boxes are tens of km, regions hundreds. */
+function boundsSpanKm(bounds) {
+  const ne = bounds?.northeast;
+  const sw = bounds?.southwest;
+  if (!ne || !sw) return null;
+  return haversineKm(sw.latitude, sw.longitude, ne.latitude, ne.longitude);
 }
 
 function countryCodeFromPlaceId(placeId) {
@@ -1976,14 +2060,20 @@ function asIso2CountryCode(value) {
   return /^[A-Z]{2}$/.test(s) ? s : null;
 }
 
-function resolveGuestLocationCountry(match, resolved, placeId) {
+/** ISO-2 for the searched place, or null when Hilton didn't tell us. */
+function countryCodeForPlace(match, resolved, placeId) {
   return (
     countryCodeFromPlaceId(placeId) ||
     asIso2CountryCode(match?.address?.country) ||
     asIso2CountryCode(resolved?.countryCode) ||
     asIso2CountryCode(match?.address?.countryCode) ||
-    "US"
+    null
   );
+}
+
+function resolveGuestLocationCountry(match, resolved, placeId) {
+  // guestLocationCountry is required by Hilton — "US" is the safe default.
+  return countryCodeForPlace(match, resolved, placeId) || "US";
 }
 
 /** Normalize Hilton hotelSummaryOptions.hotels (array or Relay-style connection). */
@@ -2020,6 +2110,7 @@ function placeFromSuggestion(suggestion, fallbackQuery = "") {
     city,
     country,
     countryCode,
+    placeCountryCode: asIso2CountryCode(countryCode),
     state: isCountry ? "" : suggestion.state || "",
     suggestionType: isCountry ? "country" : isRegion ? "region" : suggestion.type || "destination",
     placeId: suggestion.placeId || null,
@@ -2101,11 +2192,35 @@ function statesEquivalent(a, b) {
   return na === nb;
 }
 
+/**
+ * Map tiles are shared between neighbouring countries (one Caribbean tile lists
+ * AW + JM + DO), so a country search has to be cut back to the country itself.
+ */
+function filterHotelsToCountry(hotels, place, suggestion) {
+  // Never fall back to place.countryCode — that carries Hilton's "US" default.
+  const code =
+    asIso2CountryCode(place?.placeCountryCode) ||
+    countryCodeFromPlaceId(suggestion?.placeId) ||
+    asIso2CountryCode(suggestion?.countryCode);
+  const name = normalizeCityToken(place?.country || suggestion?.country || "");
+  if (!code && !name) return hotels;
+
+  const kept = hotels.filter((h) => {
+    const hCode = asIso2CountryCode(h?.countryCode);
+    const hName = normalizeCityToken(h?.country || "");
+    if (!hCode && !hName) return true; // unknown country — don't drop silently
+    if (code && hCode) return hCode === code;
+    return Boolean(name && hName && hName === name);
+  });
+  // If the country tags don't line up at all, keep Hilton's list rather than nothing.
+  return kept.length ? kept : hotels;
+}
+
 function filterHotelsToDestination(hotels, place, suggestion) {
   const radiusKm = radiusKmForSuggestion(suggestion);
-  // Country inventory: keep the full Hilton country list (no radius cut).
+  // Country inventory: full Hilton country list (no radius cut), country-scoped.
   if (radiusKm == null || isCountrySuggestion(suggestion) || place?.suggestionType === "country") {
-    return sortHotelsByDistance(hotels, place);
+    return sortHotelsByDistance(filterHotelsToCountry(hotels, place, suggestion), place);
   }
 
   const withDistance = sortHotelsByDistance(hotels, place);
@@ -2129,34 +2244,43 @@ function filterHotelsToDestination(hotels, place, suggestion) {
       if (byState.length) return byState;
     }
 
+    // A 350km ring around an island/region would reach the next country over.
     const regionCap = Math.max(radiusKm || 350, 350);
-    return withDistance.filter((h) => {
+    const inRange = withDistance.filter((h) => {
       const d = Number(h.distance);
       return Number.isFinite(d) && d <= regionCap;
     });
+    return filterHotelsToCountry(inRange, place, suggestion);
   }
 
-  // Go Hilton style for cities: keep anything within radius of the place center.
+  // City / destination: named-city hotels plus the metro ring Go Hilton shows
+  // (Rome includes Fiumicino-tagged airport properties). Empty is valid when
+  // nothing is in-city or within the metro radius (Bilbao).
+  if (targetCity) {
+    const byCity = withDistance.filter((h) => citiesEquivalent(h.city, targetCity));
+    const cap = radiusKm || 40;
+    const nearby = withDistance.filter((h) => {
+      const d = Number(h.distance);
+      return Number.isFinite(d) && d <= cap;
+    });
+    const span = boundsSpanKm(place?.bounds);
+    const inBounds =
+      span != null && span <= 80
+        ? withDistance.filter((h) => hotelInPlaceBounds(h, place.bounds))
+        : [];
+    return mergeHotelsByCtyhocn(byCity, inBounds, nearby);
+  }
+
   const nearby = withDistance.filter((h) => {
     const d = Number(h.distance);
-    if (Number.isFinite(d)) return d <= radiusKm;
-    return targetCity ? citiesEquivalent(h.city, targetCity) : false;
+    return Number.isFinite(d) && d <= (radiusKm || 40);
   });
-
-  if (nearby.length) {
-    return nearby.sort((a, b) => {
-      const aCity = targetCity && citiesEquivalent(a.city, targetCity) ? 0 : 1;
-      const bCity = targetCity && citiesEquivalent(b.city, targetCity) ? 0 : 1;
-      if (aCity !== bCity) return aCity - bCity;
-      return (a.distance ?? 1e9) - (b.distance ?? 1e9);
-    });
+  if (nearby.length) return nearby;
+  const span = boundsSpanKm(place?.bounds);
+  if (span != null && span <= 60) {
+    return withDistance.filter((h) => hotelInPlaceBounds(h, place.bounds));
   }
-
-  const hardCap = Math.max(radiusKm * 1.25, 120);
-  return withDistance.filter((h) => {
-    const d = Number(h.distance);
-    return Number.isFinite(d) && d <= hardCap;
-  });
+  return [];
 }
 
 async function fetchHotelsInQuadrants(place, { maxQuadrants = 2 } = {}) {
@@ -2253,6 +2377,7 @@ async function searchHotelsNearDestination(destination, { suggestion = null } = 
       : match.address?.stateName || match.address?.state || resolved?.state || null,
     country: match.address?.countryName || resolved?.country || null,
     countryCode,
+    placeCountryCode: countryCodeForPlace(match, resolved, placeId),
     lat: match.geometry?.location?.latitude ?? null,
     lon: match.geometry?.location?.longitude ?? null,
     placeUri: match.placeUri || null,
@@ -2264,14 +2389,23 @@ async function searchHotelsNearDestination(destination, { suggestion = null } = 
   const inventory = await fetchEntirePlaceInventory(match, resolved, countryCode);
   let hotels = inventory.hotels || [];
 
-  // Quadrant tiles are far larger than a city/region — cut back to the searched place.
-  if (hotels.length && !inventory.isCountry) {
+  // Quadrant tiles are far larger than the searched place — one Caribbean tile
+  // covers Aruba, Jamaica and the Dominican Republic. Cut back to the place.
+  if (hotels.length) {
     hotels = filterHotelsToDestination(hotels, place, resolved);
   }
   let source = inventory.source;
   let lastError = inventory.lastError;
 
-  if (!hotels.length && !inventory.isCountry && place.lat != null && place.lon != null) {
+  // Don't widen a city/region miss by pulling neighboring tiles. Go Hilton
+  // shows zero hotels when the place itself has none (e.g. Bilbao).
+  const allowExpand =
+    !isCountry &&
+    !isRegion &&
+    !place.city &&
+    place.suggestionType !== "destination";
+
+  if (!hotels.length && allowExpand && place.lat != null && place.lon != null) {
     try {
       hotels = await fetchHotelsInQuadrants(place, { maxQuadrants: 6 });
       hotels = filterHotelsToDestination(hotels, place, resolved);
@@ -2282,7 +2416,16 @@ async function searchHotelsNearDestination(destination, { suggestion = null } = 
   }
 
   if (!hotels.length) {
-    throw lastError || new Error(`No Hilton hotels found for “${place.displayName}”.`);
+    if (isCountry && lastError) {
+      throw lastError;
+    }
+    return {
+      place,
+      hotels: [],
+      resolvedSuggestion: resolved,
+      source,
+      inventoryOnly: false,
+    };
   }
 
   // Always return the full hotel list for calendar / room scanning (including
@@ -2447,44 +2590,33 @@ function normalizeShopRooms(json) {
   const avail = json?.data?.hotel?.shopAvail;
   if (!avail) return null;
   const sourceCurrency = inferCurrencyCode(avail.currencyCode, null);
-  const typeMap = new Map();
-  for (const rt of avail.roomTypes || []) {
-    if (!rt?.roomTypeCode) continue;
-    const code = String(rt.roomTypeCode).toUpperCase();
-    const name = String(rt.roomTypeName || "").trim() || code;
-    const desc = formatRoomTypeDescription(rt);
-    typeMap.set(code, {
-      roomTypeCode: code,
-      roomTypeName: name,
-      roomTypeDesc: desc.text,
-      roomTypeParagraphs: desc.paragraphs,
-      roomTypeTags: desc.tags,
-      numBeds: rt.numBeds ?? null,
-      smokingRoom: rt.smokingRoom ?? null,
-      adaAccessibleRoom: rt.adaAccessibleRoom ?? null,
-    });
-  }
-
   const rooms = [];
-  for (const rate of avail.roomRates || []) {
-    if (rate?.rateAmount == null && rate?.amountAfterTax == null) continue;
-    const code = rate.roomTypeCode ? String(rate.roomTypeCode).toUpperCase() : "";
-    const meta = typeMap.get(code) || {};
+  const seen = new Set();
+
+  const pushRate = (rt, rate) => {
+    if (!rate) return;
+    const amount = rate.rateAmount ?? rate.rateAmountUSD ?? rate.averageRate ?? null;
+    if (amount == null && rate.amountAfterTax == null) return;
+    const code = String(rate.roomTypeCode || rt?.roomTypeCode || "").toUpperCase();
     const plan = rate.ratePlan || {};
+    const key = `${code}|${rate.ratePlanCode || ""}|${amount}|${plan.specialRateType || ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const desc = formatRoomTypeDescription(rt || {});
     rooms.push({
       roomTypeCode: code || null,
-      roomTypeName: meta.roomTypeName || code || "Room",
-      roomTypeDesc: meta.roomTypeDesc || null,
-      roomTypeParagraphs: meta.roomTypeParagraphs || [],
-      roomTypeTags: meta.roomTypeTags || [],
-      numBeds: meta.numBeds ?? null,
-      smokingRoom: meta.smokingRoom ?? null,
-      adaAccessibleRoom: meta.adaAccessibleRoom ?? null,
-      amount: rate.rateAmount ?? rate.averageRate ?? rate.amountAfterTax ?? null,
+      roomTypeName: String(rt?.roomTypeName || code || "Room").trim() || "Room",
+      roomTypeDesc: desc.text || null,
+      roomTypeParagraphs: desc.paragraphs || [],
+      roomTypeTags: desc.tags || [],
+      numBeds: rt?.numBeds ?? null,
+      smokingRoom: rt?.smokingRoom ?? null,
+      adaAccessibleRoom: rt?.adaAccessibleRoom ?? null,
+      amount,
       amountFmt: rate.rateAmountFmt ?? null,
       amountAfterTax: rate.amountAfterTax ?? null,
       roomsAvail: rate.numRoomsAvail ?? null,
-      ratePlanCode: rate.ratePlanCode || null,
+      ratePlanCode: rate.ratePlanCode || plan.ratePlanCode || null,
       ratePlanName: plan.ratePlanName || null,
       ratePlanDesc: plan.ratePlanDesc || null,
       specialRateType: plan.specialRateType || null,
@@ -2494,6 +2626,46 @@ function normalizeShopRooms(json) {
         /go hilton/i.test(plan.ratePlanName || ""),
       currency: sourceCurrency,
     });
+  };
+
+  // Live shopPropAvail nests rates under roomTypes.
+  for (const rt of avail.roomTypes || []) {
+    for (const rate of rt.roomOnlyRates || []) pushRate(rt, rate);
+    for (const rate of rt.specialRoomRates || []) pushRate(rt, rate);
+    for (const rate of rt.requestedRoomRates || []) pushRate(rt, rate);
+    for (const rate of rt.packageRates || []) pushRate(rt, rate);
+    if (rt.quickBookRate) pushRate(rt, rt.quickBookRate);
+  }
+
+  // Legacy flat roomRates (older documents).
+  if (!rooms.length) {
+    const typeMap = new Map();
+    for (const rt of avail.roomTypes || []) {
+      if (!rt?.roomTypeCode) continue;
+      typeMap.set(String(rt.roomTypeCode).toUpperCase(), rt);
+    }
+    for (const rate of avail.roomRates || []) {
+      const code = rate.roomTypeCode ? String(rate.roomTypeCode).toUpperCase() : "";
+      pushRate(typeMap.get(code) || { roomTypeCode: code }, rate);
+    }
+  }
+
+  if (!rooms.length) {
+    const notes = (avail.notifications || [])
+      .map((n) => n?.text || n?.title || n?.subText)
+      .filter(Boolean)
+      .join(" · ");
+    return {
+      ctyhocn: json?.data?.hotel?.ctyhocn || null,
+      currency: sourceCurrency,
+      statusCode: avail.statusCode,
+      rooms: [],
+      emptyReason:
+        notes ||
+        (avail.statusCode != null
+          ? `Hilton status ${avail.statusCode}`
+          : "No room types/rates in shopAvail response"),
+    };
   }
 
   return {
@@ -2533,7 +2705,7 @@ async function fetchShopRooms({
   guestId = null,
   guestLocationCountry = "US",
 }) {
-  const variables = {
+  const baseVariables = {
     arrivalDate,
     departureDate,
     ctyhocn,
@@ -2549,37 +2721,77 @@ async function fetchShopRooms({
     childAges: null,
     rateCategoryTokens: null,
     ratePlanCodes: null,
+    selectedRoomRateCodes: null,
+    selectedRoomTypeCode: null,
+    pnd: null,
+    offerId: null,
+    cacheId: newShopCacheId(),
+    knownGuest: null,
+    adjoiningRoomStay: false,
     programAccountId: null,
+    ratePlanDescEnhance: true,
+    includeCUCEligibility: false,
+    bookedFor: null,
   };
 
-  const discovered = await discoverHiltonAppVersions();
-  const clients = shopAvailClientAttempts(discovered);
-  let lastError = null;
+  const query = SHOP_PROP_AVAIL_QUERY;
+  const operationName = SHOP_PROP_AVAIL_OPERATION;
+  const discoveredVersions = await discoverHiltonAppVersions();
+  let clients = shopAvailClientAttempts(discoveredVersions);
+  const cached = await loadShopAvailSuccessCombo();
+  if (cached?.appName && cached?.appVersion) {
+    clients = [
+      { appName: cached.appName, appVersion: cached.appVersion },
+      ...clients.filter(
+        (c) => !(c.appName === cached.appName && c.appVersion === cached.appVersion)
+      ),
+    ];
+  }
 
-  // Keep the allowlisted query document fixed — Hilton rejects alternate
-  // selection sets under the same operationName ("Invalid operation name").
+  let lastError = null;
   for (const client of clients) {
     try {
       const json = await hiltonGraphql(
-        "hotel_shopAvailOptions_shopAvailProp",
-        SHOP_AVAIL_QUERY,
-        variables,
+        operationName,
+        query,
+        variablesForQuery(query, { ...baseVariables, cacheId: newShopCacheId() }),
         client.appName,
         { appVersion: client.appVersion }
       );
       const parsed = normalizeShopRooms(json);
-      if (parsed) return localizeShopRoomsPayload(parsed);
+      if (parsed?.rooms?.length) {
+        await saveShopAvailSuccessCombo({
+          appName: client.appName,
+          appVersion: client.appVersion,
+          query,
+          operationName,
+        });
+        return localizeShopRoomsPayload(parsed);
+      }
+      if (parsed && !parsed.rooms?.length) {
+        lastError = new Error(
+          parsed.emptyReason || "No room rates returned for that stay."
+        );
+        // Response shaped correctly but empty — no point trying other clients.
+        break;
+      }
       lastError = new Error("No room rates returned for that stay.");
     } catch (err) {
       lastError = err;
       if (isUnauthorizedError(err)) throw err;
-      // Try next client on allowlist / version mismatches.
       if (isInvalidOperationNameError(err)) continue;
-      // Other hard failures: still try remaining clients once or twice, then stop.
       if (/403|blocked|forbidden/i.test(String(err?.message || ""))) continue;
-      break;
+      // Schema mismatch on this client — try next version.
+      if (
+        /cannot query field|unknown argument|got invalid value|variable/i.test(
+          String(err?.message || "")
+        )
+      ) {
+        continue;
+      }
     }
   }
+
   throw lastError || new Error("Room shop failed.");
 }
 

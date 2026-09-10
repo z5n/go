@@ -102,6 +102,12 @@ async function setCachedCalendar(params, calendar) {
       if (f && f.toUpperCase() !== ctyhocn) return f;
       return n || f || null;
     };
+    const pickCoord = (next, fallback) => {
+      const n = Number(next);
+      if (Number.isFinite(n)) return n;
+      const f = Number(fallback);
+      return Number.isFinite(f) ? f : null;
+    };
 
     // If this key never stored a name, borrow identity from any other calendar for the same hotel.
     let sibling = null;
@@ -147,6 +153,8 @@ async function setCachedCalendar(params, calendar) {
         params.country || calendar.country,
         prev?.country || sibling?.country
       ),
+      lat: pickCoord(params.lat ?? calendar.lat, prev?.lat ?? sibling?.lat),
+      lon: pickCoord(params.lon ?? calendar.lon, prev?.lon ?? sibling?.lon),
       fetchedAt: Date.now(),
       calendar: {
         ctyhocn: calendar.ctyhocn,
@@ -354,11 +362,81 @@ async function deleteCachedShopRooms(params) {
   }
 }
 
+/**
+ * Unique hotels from the calendar cache for the coverage map.
+ * Aggregates entry counts; prefers stored lat/lon.
+ */
+async function listCachedMapHotels({ includeStale = true } = {}) {
+  const entries = await listCachedCalendars({ includeStale });
+  const byHotel = new Map();
+  for (const entry of entries) {
+    const ctyhocn = String(entry.ctyhocn || entry.calendar?.ctyhocn || "").toUpperCase();
+    if (!ctyhocn) continue;
+    const prev = byHotel.get(ctyhocn) || {
+      ctyhocn,
+      hotelName: null,
+      city: null,
+      country: null,
+      brandCode: null,
+      lat: null,
+      lon: null,
+      entries: 0,
+      lastFetchedAt: 0,
+    };
+    prev.entries += 1;
+    prev.lastFetchedAt = Math.max(prev.lastFetchedAt, Number(entry.fetchedAt || 0));
+    if (!prev.hotelName && entry.hotelName) prev.hotelName = entry.hotelName;
+    if (!prev.city && entry.city) prev.city = entry.city;
+    if (!prev.country && entry.country) prev.country = entry.country;
+    if (!prev.brandCode && entry.brandCode) prev.brandCode = entry.brandCode;
+    const lat = Number(entry.lat);
+    const lon = Number(entry.lon);
+    if (prev.lat == null && Number.isFinite(lat)) prev.lat = lat;
+    if (prev.lon == null && Number.isFinite(lon)) prev.lon = lon;
+    byHotel.set(ctyhocn, prev);
+  }
+  return [...byHotel.values()].sort((a, b) => b.entries - a.entries);
+}
+
+/** Write lat/lon onto every calendar cache row for a hotel (map backfill). */
+async function updateCachedHotelCoords(ctyhocn, lat, lon) {
+  const code = String(ctyhocn || "").toUpperCase();
+  const la = Number(lat);
+  const lo = Number(lon);
+  if (!code || !Number.isFinite(la) || !Number.isFinite(lo)) return 0;
+  const db = await openDb();
+  try {
+    let updated = 0;
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite");
+      const store = tx.objectStore(STORE);
+      const req = store.openCursor();
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) return;
+        const entry = cursor.value;
+        if (String(entry?.ctyhocn || "").toUpperCase() === code) {
+          cursor.update({ ...entry, lat: la, lon: lo });
+          updated += 1;
+        }
+        cursor.continue();
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    return updated;
+  } finally {
+    db.close();
+  }
+}
+
 export {
   getCachedCalendar,
   setCachedCalendar,
   deleteCachedCalendar,
   listCachedCalendars,
+  listCachedMapHotels,
+  updateCachedHotelCoords,
   getCachedShopRooms,
   setCachedShopRooms,
   deleteCachedShopRooms,

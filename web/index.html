@@ -14,6 +14,7 @@
         </a>
         <nav class="nav-links">
           <a class="active" href="index.html">Search</a>
+          <a href="map.html">Map</a>
           <a href="metrics.html">Metrics</a>
           <a href="https://www.hilton.com/en/go-hilton/" target="_blank" rel="noopener">Go Portal</a>
         </nav>
@@ -24,7 +25,7 @@
         <section class="hero">
           <h1>Find room availability</h1>
           <p class="lede">
-            Pick an arrival window and stay length.
+            Add one or more stays.
           </p>
         </section>
 
@@ -46,18 +47,10 @@
                 />
                 <div id="destinationSuggest" class="suggest-panel" hidden role="listbox"></div>
               </label>
-              <label class="field date-field">
-                <span class="field-label">Search from</span>
-                <input id="fromDate" name="fromDate" type="text" inputmode="none" autocomplete="off" />
-              </label>
-              <label class="field date-field">
-                <span class="field-label">Search to</span>
-                <input id="toDate" name="toDate" type="text" inputmode="none" autocomplete="off" />
-              </label>
-              <label class="field field-sm">
-                <span class="field-label">Nights</span>
-                <input id="nights" name="nights" type="number" min="1" max="7" value="1" title="Length of stay in nights (check-out = check-in + nights). Clear when searching Cached to include all stay lengths." />
-              </label>
+              <div class="field dates-field">
+                <span class="field-label">Stays</span>
+                <div id="dateRanges" aria-label="Stay date ranges"></div>
+              </div>
               <button class="search-btn" type="submit" id="searchBtn">Search</button>
             </div>
           </div>
@@ -71,7 +64,7 @@
               </label>
               <label class="chip chip-sm">
                 <span class="chip-label">Min rooms</span>
-                <input id="minRooms" type="number" min="1" max="9" value="1" />
+                <input id="minRooms" type="number" min="0" max="9" value="1" />
               </label>
               <div class="dow-filter rate-type-filter">
                 <button
@@ -103,7 +96,7 @@
           </div>
         </form>
 
-        <section class="status-bar" id="statusBar">Enter a destination and date range to begin.</section>
+        <section class="status-bar" id="statusBar">Enter a destination and at least one stay to begin.</section>
         <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
 
         <section class="results-wrap">
@@ -132,6 +125,35 @@
                   </div>
                 </div>
               </div>
+            </div>
+            <div class="results-pager" id="resultsPager" hidden>
+              <label class="page-size-field">
+                <span>Show</span>
+                <select id="pageSize" aria-label="Rows per page">
+                  <option value="25" selected>25</option>
+                  <option value="50">50</option>
+                  <option value="75">75</option>
+                  <option value="100">100</option>
+                </select>
+              </label>
+              <button type="button" class="ghost-btn pager-btn" id="pagePrev" disabled>Prev</button>
+              <span class="page-meta" id="pageMeta">
+                <span id="pageRangeLabel"></span>
+                <span class="page-jump">
+                  page
+                  <input
+                    type="number"
+                    id="pageJump"
+                    class="page-jump-input"
+                    min="1"
+                    step="1"
+                    inputmode="numeric"
+                    aria-label="Go to page"
+                  />
+                  <span id="pageTotalLabel"></span>
+                </span>
+              </span>
+              <button type="button" class="ghost-btn pager-btn" id="pageNext" disabled>Next</button>
             </div>
             <button type="button" class="ghost-btn" id="exportBtn" disabled>Export CSV</button>
           </div>

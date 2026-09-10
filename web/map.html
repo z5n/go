@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>go+ — Cache map</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app map-app">
+      <header class="topnav">
+        <a class="brand" href="index.html">
+          <span class="brand-mark">go</span><span class="brand-plus">+</span>
+        </a>
+        <nav class="nav-links">
+          <a href="index.html">Search</a>
+          <a class="active" href="map.html">Map</a>
+          <a href="metrics.html">Metrics</a>
+          <a href="https://www.hilton.com/en/go-hilton/" target="_blank" rel="noopener">Go Portal</a>
+        </nav>
+      </header>
+
+      <main class="map-main">
+        <section class="hero map-hero">
+          <h1>Cache coverage</h1>
+          <p class="lede">
+            Heat map of hotels you’ve already scanned into the local rate cache.
+          </p>
+        </section>
+
+        <section class="metrics-summary map-summary">
+          <div class="metric-card">
+            <div class="metric-label">Hotels</div>
+            <div class="metric-value" id="mapHotels">0</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">In view</div>
+            <div class="metric-value" id="mapPlotted">0</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Cache entries</div>
+            <div class="metric-value" id="mapEntries">0</div>
+          </div>
+        </section>
+
+        <section class="results-wrap map-panel">
+          <div class="results-meta map-toolbar">
+            <div id="mapLabel">Loading…</div>
+            <button type="button" class="ghost-btn" id="refreshMapBtn">Refresh</button>
+          </div>
+          <iframe
+            id="mapFrame"
+            class="map-canvas map-frame"
+            src="map-sandbox.html"
+            title="Cached hotel coverage map"
+          ></iframe>
+        </section>
+      </main>
+
+      <footer class="site-footer map-footer">
+        <details class="map-key-details">
+          <summary>Maps API key</summary>
+          <div class="map-key-panel">
+            <label class="map-api-field">
+              <span class="visually-hidden">Google Maps API key</span>
+              <input
+                id="mapsApiKey"
+                type="password"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="AIza…"
+              />
+            </label>
+            <button type="button" class="ghost-btn" id="saveMapsKeyBtn">Save</button>
+          </div>
+        </details>
+        <span class="map-footer-credit">
+          Developed by
+          <a href="https://github.com/z5n" target="_blank" rel="noopener">z5n</a>
+        </span>
+      </footer>
+    </div>
+    <script type="module" src="map.js"></script>
+  </body>
+</html>

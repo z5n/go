@@ -5,20 +5,6 @@
  */
 
 const WEEKDAYS = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
-const MONTHS = [
-  "January",
-  "February",
-  "March",
-  "April",
-  "May",
-  "June",
-  "July",
-  "August",
-  "September",
-  "October",
-  "November",
-  "December",
-];
 const MONTHS_SHORT = [
   "Jan",
   "Feb",
@@ -81,6 +67,54 @@ function formatDisplayDate(iso) {
   });
 }
 
+function formatRangeLabel(from, to, { compact = false } = {}) {
+  if (!from && !to) return "";
+  const nights = nightsBetween(from, to || from);
+  const stayBit = nights === 1 ? "1 night" : `${nights} nights`;
+  if (from && to && from === to) {
+    return compact ? formatDisplayDate(from) : `${formatDisplayDate(from)} · ${stayBit}`;
+  }
+  if (from && to) {
+    const span = `${formatDisplayDate(from)} → ${formatDisplayDate(to)}`;
+    return compact ? span : `${span} · ${stayBit}`;
+  }
+  if (from) return `from ${formatDisplayDate(from)}`;
+  return `to ${formatDisplayDate(to)}`;
+}
+
+function nightsBetween(from, to) {
+  const a = parseISODate(from);
+  const b = parseISODate(to);
+  if (!a || !b) return 1;
+  const ms = b.getTime() - a.getTime();
+  const days = Math.round(ms / 86400000);
+  return Math.max(1, days);
+}
+
+function normalizeRange(from, to) {
+  if (!from) return null;
+  let start = from;
+  let end = to || from;
+  if (end < start) {
+    const tmp = start;
+    start = end;
+    end = tmp;
+  }
+  // Same-day pick = 1-night stay (check-out next day).
+  if (end === start) {
+    const d = parseISODate(start);
+    if (!d) return null;
+    d.setDate(d.getDate() + 1);
+    end = toISODate(d);
+  }
+  return { from: start, to: end };
+}
+
+function isoInRange(iso, from, to) {
+  if (!iso || !from || !to) return false;
+  return iso >= from && iso <= to;
+}
+
 function yearOptions(centerYear) {
   const start = centerYear - 80;
   const end = centerYear + 20;
@@ -90,29 +124,44 @@ function yearOptions(centerYear) {
 }
 
 /**
+ * Range calendar: first click = start, second = end.
  * @param {HTMLElement} root
  * @param {{
- *   selected?: string | null,
+ *   from?: string | null,
+ *   to?: string | null,
+ *   existingRanges?: Array<{ from: string, to: string }>,
  *   month?: Date,
- *   onSelect?: (iso: string | null) => void,
+ *   onChange?: (draft: { from: string | null, to: string | null }) => void,
+ *   onComplete?: (range: { from: string, to: string }) => void,
  *   showOutsideDays?: boolean,
  * }} options
  */
-function createCalendar(root, options = {}) {
+function createRangeCalendar(root, options = {}) {
   const state = {
-    selected: options.selected || null,
-    month: startOfMonth(options.month || parseISODate(options.selected) || new Date()),
+    from: options.from || null,
+    to: options.to || null,
+    hover: null,
+    month: startOfMonth(
+      options.month ||
+        parseISODate(options.from) ||
+        parseISODate(options.to) ||
+        new Date()
+    ),
+    existingRanges: Array.isArray(options.existingRanges) ? options.existingRanges : [],
     showOutsideDays: options.showOutsideDays !== false,
   };
 
   root.classList.add("ui-calendar");
   root.setAttribute("role", "application");
-  root.setAttribute("aria-label", "Calendar");
+  root.setAttribute("aria-label", "Date range calendar");
 
-  function emitSelect(iso) {
-    state.selected = iso;
-    options.onSelect?.(iso);
-    render();
+  function previewEnd() {
+    if (state.from && !state.to && state.hover) return state.hover;
+    return state.to;
+  }
+
+  function emitChange() {
+    options.onChange?.({ from: state.from, to: state.to });
   }
 
   function render() {
@@ -120,7 +169,12 @@ function createCalendar(root, options = {}) {
     const year = month.getFullYear();
     const monthIndex = month.getMonth();
     const today = new Date();
-    const selected = parseISODate(state.selected);
+    const draftEnd = previewEnd();
+    const draft = normalizeRange(state.from, draftEnd);
+    const hint =
+      state.from && !state.to
+        ? "Select check-out"
+        : "Select check-in";
 
     const firstDow = new Date(year, monthIndex, 1).getDay();
     const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
@@ -148,20 +202,28 @@ function createCalendar(root, options = {}) {
         continue;
       }
       const iso = toISODate(cellDate);
-      const isSelected = sameDay(cellDate, selected);
+      const isStart = state.from && iso === state.from;
+      const isEnd = draftEnd && iso === draftEnd && Boolean(state.from);
+      const inDraft =
+        draft && isoInRange(iso, draft.from, draft.to) && !isStart && !isEnd;
+      const inExisting = state.existingRanges.some(
+        (r) => isoInRange(iso, r.from, r.to)
+      );
       const isToday = sameDay(cellDate, today);
       const classes = [
         "ui-calendar-day",
         outside ? "outside" : "",
-        isSelected ? "selected" : "",
+        isStart || isEnd ? "selected" : "",
+        isStart ? "range-start" : "",
+        isEnd ? "range-end" : "",
+        inDraft ? "in-range" : "",
+        inExisting && !isStart && !isEnd && !inDraft ? "existing-range" : "",
         isToday ? "today" : "",
       ]
         .filter(Boolean)
         .join(" ");
       cells.push(
-        `<button type="button" class="${classes}" data-date="${iso}" aria-label="${iso}"${
-          isSelected ? ' aria-pressed="true"' : ""
-        }>${dayNum}</button>`
+        `<button type="button" class="${classes}" data-date="${iso}" aria-label="${iso}">${dayNum}</button>`
       );
     }
 
@@ -174,6 +236,7 @@ function createCalendar(root, options = {}) {
       .join("");
 
     root.innerHTML = `
+      <div class="ui-calendar-hint">${hint}</div>
       <div class="ui-calendar-header">
         <button type="button" class="ui-calendar-nav" data-cal-nav="-1" aria-label="Previous month">‹</button>
         <div class="ui-calendar-caption">
@@ -205,19 +268,50 @@ function createCalendar(root, options = {}) {
       e.preventDefault();
       const iso = toISODate(new Date());
       state.month = startOfMonth(new Date());
-      emitSelect(iso);
+      state.from = iso;
+      state.to = null;
+      state.hover = null;
+      emitChange();
+      render();
       return;
     }
     if (e.target.closest("[data-cal-clear]")) {
       e.preventDefault();
-      emitSelect(null);
+      state.from = null;
+      state.to = null;
+      state.hover = null;
+      emitChange();
+      render();
       return;
     }
     const day = e.target.closest(".ui-calendar-day[data-date]");
     if (day) {
       e.preventDefault();
-      emitSelect(day.dataset.date);
+      const iso = day.dataset.date;
+      if (!state.from || state.to) {
+        state.from = iso;
+        state.to = null;
+        state.hover = null;
+        emitChange();
+        render();
+        return;
+      }
+      const range = normalizeRange(state.from, iso);
+      state.from = range.from;
+      state.to = range.to;
+      state.hover = null;
+      emitChange();
+      render();
+      options.onComplete?.(range);
     }
+  });
+
+  root.addEventListener("pointerover", (e) => {
+    const day = e.target.closest(".ui-calendar-day[data-date]");
+    if (!day || !state.from || state.to) return;
+    if (state.hover === day.dataset.date) return;
+    state.hover = day.dataset.date;
+    render();
   });
 
   root.addEventListener("change", (e) => {
@@ -235,14 +329,24 @@ function createCalendar(root, options = {}) {
   render();
 
   return {
-    setSelected(iso) {
-      state.selected = iso || null;
-      const parsed = parseISODate(iso);
+    setDraft(from, to) {
+      state.from = from || null;
+      state.to = to || null;
+      state.hover = null;
+      const parsed = parseISODate(state.from || state.to);
       if (parsed) state.month = startOfMonth(parsed);
       render();
     },
-    getSelected() {
-      return state.selected;
+    setExistingRanges(ranges) {
+      state.existingRanges = Array.isArray(ranges) ? ranges : [];
+      render();
+    },
+    resetDraft() {
+      state.from = null;
+      state.to = null;
+      state.hover = null;
+      render();
+      emitChange();
     },
     destroy() {
       root.innerHTML = "";
@@ -250,58 +354,46 @@ function createCalendar(root, options = {}) {
   };
 }
 
-const pickers = new Map();
-let openPickerId = null;
+let rangesFieldApi = null;
 let sharedPanel = null;
 let sharedCalendar = null;
 let sharedCalendarApi = null;
+let panelOpen = false;
 
-function ensurePanel() {
+function ensureRangesPanel() {
   if (sharedPanel) return sharedPanel;
   sharedPanel = document.createElement("div");
-  sharedPanel.className = "date-picker-panel";
+  sharedPanel.className = "date-picker-panel date-ranges-panel";
   sharedPanel.hidden = true;
   sharedPanel.setAttribute("role", "dialog");
-  sharedPanel.setAttribute("aria-label", "Choose a date");
+  sharedPanel.setAttribute("aria-label", "Choose date ranges");
   sharedCalendar = document.createElement("div");
   sharedPanel.appendChild(sharedCalendar);
   document.body.appendChild(sharedPanel);
 
   sharedPanel.addEventListener("click", (e) => e.stopPropagation());
 
-  sharedCalendarApi = createCalendar(sharedCalendar, {
-    onSelect(iso) {
-      if (!openPickerId) return;
-      const picker = pickers.get(openPickerId);
-      if (!picker) return;
-      picker.setValue(iso || "");
-      closeDatePicker();
-    },
-  });
-
-  document.addEventListener("click", () => closeDatePicker());
+  document.addEventListener("click", () => closeRangesPanel());
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeDatePicker();
+    if (e.key === "Escape") closeRangesPanel();
   });
   window.addEventListener("resize", () => {
-    if (openPickerId) positionPanel(openPickerId);
+    if (panelOpen) positionRangesPanel();
   });
 
   return sharedPanel;
 }
 
-function positionPanel(id) {
-  const picker = pickers.get(id);
-  const panel = ensurePanel();
-  if (!picker || panel.hidden) return;
-  const rect = picker.trigger.getBoundingClientRect();
-  const width = Math.max(288, panel.offsetWidth || 288);
+function positionRangesPanel() {
+  const panel = ensureRangesPanel();
+  const trigger = rangesFieldApi?.trigger;
+  if (!trigger || panel.hidden) return;
+  const rect = trigger.getBoundingClientRect();
+  const width = Math.max(300, panel.offsetWidth || 300);
   const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8);
-  let top = rect.bottom + 8;
   panel.style.left = `${left}px`;
-  panel.style.top = `${top}px`;
+  panel.style.top = `${rect.bottom + 8}px`;
   panel.style.width = `${width}px`;
-  // Flip above if needed after layout.
   requestAnimationFrame(() => {
     const h = panel.offsetHeight;
     if (rect.bottom + 8 + h > window.innerHeight - 8 && rect.top - 8 - h > 8) {
@@ -310,161 +402,180 @@ function positionPanel(id) {
   });
 }
 
-function closeDatePicker() {
+function closeRangesPanel() {
   if (!sharedPanel) return;
   sharedPanel.hidden = true;
-  if (openPickerId) {
-    const picker = pickers.get(openPickerId);
-    picker?.trigger.setAttribute("aria-expanded", "false");
-  }
-  openPickerId = null;
+  panelOpen = false;
+  rangesFieldApi?.trigger?.setAttribute("aria-expanded", "false");
+  sharedCalendarApi?.resetDraft?.();
 }
 
-function openDatePicker(id) {
-  ensurePanel();
-  const picker = pickers.get(id);
-  if (!picker) return;
-  if (openPickerId && openPickerId !== id) {
-    pickers.get(openPickerId)?.trigger.setAttribute("aria-expanded", "false");
+function openRangesPanel() {
+  if (!rangesFieldApi) return;
+  ensureRangesPanel();
+  if (!sharedCalendarApi) {
+    sharedCalendarApi = createRangeCalendar(sharedCalendar, {
+      onComplete(range) {
+        rangesFieldApi?.addRange(range);
+        sharedCalendarApi?.setExistingRanges(rangesFieldApi.getRanges());
+        sharedCalendarApi?.resetDraft();
+        positionRangesPanel();
+      },
+    });
   }
-  openPickerId = id;
-  sharedCalendarApi.setSelected(picker.input.value || null);
+  sharedCalendarApi.setExistingRanges(rangesFieldApi.getRanges());
+  sharedCalendarApi.resetDraft();
   sharedPanel.hidden = false;
-  picker.trigger.setAttribute("aria-expanded", "true");
-  positionPanel(id);
+  panelOpen = true;
+  rangesFieldApi.trigger.setAttribute("aria-expanded", "true");
+  positionRangesPanel();
 }
 
-function syncPickerDisplay(picker) {
-  const iso = picker.input.value;
-  const label = formatDisplayDate(iso);
-  if (label) {
-    picker.valueEl.textContent = label;
-    picker.valueEl.hidden = false;
-    picker.placeholderEl.hidden = true;
-    picker.trigger.classList.remove("is-empty");
-    if (picker.clearBtn) picker.clearBtn.hidden = false;
-  } else {
-    picker.valueEl.textContent = "";
-    picker.valueEl.hidden = true;
-    picker.placeholderEl.hidden = false;
-    picker.trigger.classList.add("is-empty");
-    if (picker.clearBtn) picker.clearBtn.hidden = true;
-  }
+function escapeAttr(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;");
 }
 
 /**
- * Enhance a field that contains a hidden/text input#id with a calendar popover.
- * @param {string} inputId
+ * Multi-range dates field: chips + popover range calendar.
+ * @param {string} rootId
+ * @param {{ onChange?: (ranges: Array<{from:string,to:string}>) => void }} [options]
  */
-function attachDatePicker(inputId) {
-  const input = document.getElementById(inputId);
-  if (!input || pickers.has(inputId)) return pickers.get(inputId);
+function setupDateRangesField(rootId, options = {}) {
+  const root = document.getElementById(rootId);
+  if (!root) return null;
+  if (rangesFieldApi?.id === rootId) return rangesFieldApi;
 
-  const wrap = document.createElement("div");
-  wrap.className = "date-picker";
-  wrap.dataset.datePicker = inputId;
-
-  const trigger = document.createElement("button");
-  trigger.type = "button";
-  trigger.className = "date-picker-trigger";
-  trigger.setAttribute("aria-haspopup", "dialog");
-  trigger.setAttribute("aria-expanded", "false");
-  trigger.innerHTML = `
-    <span class="date-picker-value"></span>
-    <span class="date-picker-placeholder">Pick a date</span>
-    <span class="date-picker-icon" aria-hidden="true">
-      <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4">
-        <rect x="2" y="3.5" width="12" height="10.5" rx="2"/>
-        <path d="M2 6.5h12M5.5 2v3M10.5 2v3"/>
-      </svg>
-    </span>
+  root.classList.add("date-ranges-field");
+  root.innerHTML = `
+    <div class="date-ranges-surface">
+      <div class="date-ranges-chips"></div>
+      <button type="button" class="date-ranges-trigger" aria-haspopup="dialog" aria-expanded="false">
+        <span class="date-ranges-placeholder">Add stays</span>
+        <span class="date-ranges-icon" aria-hidden="true">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4">
+            <rect x="2" y="3.5" width="12" height="10.5" rx="2"/>
+            <path d="M2 6.5h12M5.5 2v3M10.5 2v3"/>
+          </svg>
+        </span>
+      </button>
+    </div>
   `;
 
-  const clearBtn = document.createElement("button");
-  clearBtn.type = "button";
-  clearBtn.className = "date-picker-clear";
-  clearBtn.setAttribute("aria-label", "Clear date");
-  clearBtn.hidden = true;
-  clearBtn.innerHTML = `
-    <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
-      <path d="M4 4l8 8M12 4l-8 8"/>
-    </svg>
-  `;
+  const surface = root.querySelector(".date-ranges-surface");
+  const trigger = root.querySelector(".date-ranges-trigger");
+  const chipsEl = root.querySelector(".date-ranges-chips");
+  const placeholderEl = root.querySelector(".date-ranges-placeholder");
+  let ranges = [];
 
-  const parent = input.parentElement;
-  input.type = "hidden";
-  input.removeAttribute("required");
-  parent.insertBefore(wrap, input);
-  wrap.appendChild(input);
-  wrap.appendChild(trigger);
-  wrap.appendChild(clearBtn);
+  function rangesEqual(a, b) {
+    return a.from === b.from && a.to === b.to;
+  }
 
-  const picker = {
-    id: inputId,
-    input,
-    wrap,
+  function sync() {
+    if (!ranges.length) {
+      chipsEl.innerHTML = "";
+      chipsEl.hidden = true;
+      placeholderEl.hidden = false;
+      surface.classList.add("is-empty");
+      return;
+    }
+    placeholderEl.hidden = true;
+    chipsEl.hidden = false;
+    surface.classList.remove("is-empty");
+    chipsEl.innerHTML = ranges
+      .map(
+        (r, i) =>
+          `<span class="date-range-chip" data-range-index="${i}">
+            <span class="date-range-chip-label">${escapeAttr(formatRangeLabel(r.from, r.to, { compact: true }))}</span>
+            <button type="button" class="date-range-chip-remove" data-remove-range="${i}" aria-label="Remove range">×</button>
+          </span>`
+      )
+      .join("");
+  }
+
+  function emit() {
+    options.onChange?.(ranges.map((r) => ({ ...r })));
+  }
+
+  const api = {
+    id: rootId,
     trigger,
-    clearBtn,
-    valueEl: trigger.querySelector(".date-picker-value"),
-    placeholderEl: trigger.querySelector(".date-picker-placeholder"),
-    setValue(iso) {
-      input.value = iso || "";
-      syncPickerDisplay(picker);
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
+    getRanges() {
+      return ranges.map((r) => ({ ...r }));
     },
-    sync() {
-      syncPickerDisplay(picker);
+    setRanges(next) {
+      ranges = (Array.isArray(next) ? next : [])
+        .map((r) => normalizeRange(r.from || r.fromDate, r.to || r.toDate))
+        .filter(Boolean);
+      sync();
+      emit();
+      if (panelOpen) sharedCalendarApi?.setExistingRanges(api.getRanges());
     },
+    addRange(range) {
+      const normalized = normalizeRange(range.from, range.to);
+      if (!normalized) return;
+      if (ranges.some((r) => rangesEqual(r, normalized))) return;
+      ranges = [...ranges, normalized].sort((a, b) =>
+        a.from === b.from ? a.to.localeCompare(b.to) : a.from.localeCompare(b.from)
+      );
+      sync();
+      emit();
+    },
+    removeRange(index) {
+      if (index < 0 || index >= ranges.length) return;
+      ranges = ranges.filter((_, i) => i !== index);
+      sync();
+      emit();
+      if (panelOpen) sharedCalendarApi?.setExistingRanges(api.getRanges());
+    },
+    sync,
   };
 
-  trigger.addEventListener("click", (e) => {
+  surface.addEventListener("click", (e) => {
+    const remove = e.target.closest("[data-remove-range]");
+    if (remove) {
+      e.preventDefault();
+      e.stopPropagation();
+      api.removeRange(Number(remove.dataset.removeRange));
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     document.dispatchEvent(new CustomEvent("goplus:close-overlays"));
-    if (openPickerId === inputId && sharedPanel && !sharedPanel.hidden) {
-      closeDatePicker();
-    } else {
-      openDatePicker(inputId);
-    }
+    if (panelOpen) closeRangesPanel();
+    else openRangesPanel();
   });
 
-  clearBtn.addEventListener("click", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (openPickerId === inputId) closeDatePicker();
-    picker.setValue("");
-  });
-
-  pickers.set(inputId, picker);
-  syncPickerDisplay(picker);
-  return picker;
+  rangesFieldApi = api;
+  sync();
+  return api;
 }
 
-function setupDatePickers(ids = ["fromDate", "toDate"]) {
-  for (const id of ids) attachDatePicker(id);
+function refreshDateRangesField() {
+  rangesFieldApi?.sync?.();
 }
 
-function refreshDatePickers(ids = ["fromDate", "toDate"]) {
-  for (const id of ids) {
-    const picker = pickers.get(id) || attachDatePicker(id);
-    picker?.sync();
-  }
+function getDateRanges() {
+  return rangesFieldApi?.getRanges?.() || [];
 }
 
-function setDatePickerValue(id, iso) {
-  const picker = pickers.get(id) || attachDatePicker(id);
-  if (!picker) return;
-  picker.input.value = iso || "";
-  picker.sync();
+function setDateRanges(ranges) {
+  rangesFieldApi?.setRanges?.(ranges);
 }
 
 export {
-  createCalendar,
-  setupDatePickers,
-  refreshDatePickers,
-  setDatePickerValue,
+  createRangeCalendar,
+  setupDateRangesField,
+  refreshDateRangesField,
+  getDateRanges,
+  setDateRanges,
   formatDisplayDate,
+  formatRangeLabel,
+  nightsBetween,
   toISODate,
   parseISODate,
+  normalizeRange,
 };

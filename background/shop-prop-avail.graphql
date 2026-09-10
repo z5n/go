@@ -1,0 +1,251 @@
+query hotel_shopAvailOptions_shopPropAvail($arrivalDate: String!, $ctyhocn: String!, $departureDate: String!, $language: String!, $guestLocationCountry: String, $numAdults: Int!, $numChildren: Int!, $numRooms: Int!, $displayCurrency: String, $guestId: BigInt, $specialRates: ShopSpecialRateInput, $rateCategoryTokens: [String], $selectedRoomRateCodes: [ShopRoomRateCodeInput!], $ratePlanCodes: [String], $pnd: String, $offerId: BigInt, $cacheId: String!, $knownGuest: Boolean, $childAges: [Int], $adjoiningRoomStay: Boolean, $modifyingReservation: Boolean, $programAccountId: BigInt, $ratePlanDescEnhance: Boolean, $includeCUCEligibility: Boolean, $bookedFor: ShopBookedFor) {
+  hotel(ctyhocn: $ctyhocn, language: $language) {
+    ctyhocn
+    shopAvailOptions(input: {offerId: $offerId, pnd: $pnd}) {
+      maxNumChildren
+      altCorporateAccount {
+        corporateId
+        name
+      }
+      contentOffer {
+        name
+      }
+    }
+    shopAvail(
+      cacheId: $cacheId
+      input: {bookedFor: $bookedFor, guestLocationCountry: $guestLocationCountry, arrivalDate: $arrivalDate, departureDate: $departureDate, displayCurrency: $displayCurrency, numAdults: $numAdults, numChildren: $numChildren, numRooms: $numRooms, guestId: $guestId, specialRates: $specialRates, rateCategoryTokens: $rateCategoryTokens, selectedRoomRateCodes: $selectedRoomRateCodes, ratePlanCodes: $ratePlanCodes, knownGuest: $knownGuest, childAges: $childAges, adjoiningRoomStay: $adjoiningRoomStay, modifyingReservation: $modifyingReservation, programAccountId: $programAccountId, ratePlanDescEnhance: $ratePlanDescEnhance, includeCUCEligibility: $includeCUCEligibility}
+    ) {
+      statusCode
+      addOnsAvailable
+      summary {
+        specialRates {
+          specialRateType
+          roomCount
+        }
+        requestedRates {
+          ratePlanCode
+          ratePlanName
+          roomCount
+        }
+      }
+      notifications {
+        subText
+        subType
+        title
+        text
+      }
+      currencyCode
+      roomTypes {
+        roomTypeCode
+        adaAccessibleRoom
+        adjoiningRoom
+        numBeds
+        roomTypeName
+        roomTypeDesc
+        roomTypeOffers {
+          offerType
+        }
+        roomOccupancy
+        executive
+        suite
+        code: roomTypeCode
+        name: roomTypeName
+        thumbnail: carousel(first: 1) {
+          _id
+          altText
+          variants {
+            size
+            url
+          }
+        }
+        quickBookRate {
+          ratePlan {
+            specialRateType
+            serviceChargesAndTaxesIncluded
+          }
+        }
+        roomOnlyRates {
+          confUpgradeAvailable
+          roomTypeCode
+          ratePlanCode
+          rateAmount
+          rateAmountFmt(decimal: 0, strategy: ceiling)
+          rateAmountUSD: rateAmount(currencyCode: "USD")
+          amountAfterTaxFmt(decimal: 0, strategy: ceiling)
+          fullAmountAfterTax: amountAfterTaxFmt
+          rateChangeIndicator
+          feeTransparencyIndicator
+          cmaTotalPriceIndicator
+          guarantee {
+            guarPolicyCode
+            cxlPolicyCode
+            depositRequired
+            nonRefundable
+            isAfterCxlDeadline
+          }
+          ratePlan {
+            attributes
+            commissionable
+            confidentialRates
+            ratePlanName
+            ratePlanDesc
+            ratePlanCode
+            hhonorsMembershipRequired
+            advancePurchase
+            serviceChargesAndTaxesIncluded
+            specialRateType
+          }
+          hhonorsDiscountRate {
+            confUpgradeAvailable
+            rateChangeIndicator
+            ratePlanCode
+            roomTypeCode
+            rateAmount
+            rateAmountFmt(decimal: 0, strategy: ceiling)
+            rateAmountUSD: rateAmount(currencyCode: "USD")
+            amountAfterTaxFmt(decimal: 0, strategy: ceiling)
+            fullAmountAfterTax: amountAfterTaxFmt
+            guarantee {
+              guarPolicyCode
+              cxlPolicyCode
+            }
+            ratePlan {
+              attributes
+              commissionable
+              confidentialRates
+              ratePlanName
+              ratePlanDesc
+              ratePlanCode
+              advancePurchase
+              serviceChargesAndTaxesIncluded
+              specialRateType
+            }
+          }
+          serviceChargeDesc: serviceChargeDetails
+        }
+        requestedRoomRates {
+          confUpgradeAvailable
+          ratePlanCode
+          rateAmount
+          rateAmountFmt(decimal: 0, strategy: ceiling)
+          rateAmountUSD: rateAmount(currencyCode: "USD")
+          amountAfterTaxFmt(decimal: 0, strategy: ceiling)
+          fullAmountAfterTax: amountAfterTaxFmt
+          rateChangeIndicator
+          feeTransparencyIndicator
+          cmaTotalPriceIndicator
+          guarantee {
+            depositRequired
+            nonRefundable
+            isAfterCxlDeadline
+          }
+          ratePlan {
+            attributes
+            commissionable
+            confidentialRates
+            ratePlanName
+            ratePlanDesc
+            hhonorsMembershipRequired
+            serviceChargesAndTaxesIncluded
+            specialRateType
+          }
+          serviceChargeDesc: serviceChargeDetails
+        }
+        specialRoomRates {
+          confUpgradeAvailable
+          ratePlanCode
+          rateAmount
+          rateAmountFmt(decimal: 0, strategy: ceiling)
+          rateAmountUSD: rateAmount(currencyCode: "USD")
+          amountAfterTaxFmt(decimal: 0, strategy: ceiling)
+          fullAmountAfterTax: amountAfterTaxFmt
+          rateChangeIndicator
+          feeTransparencyIndicator
+          cmaTotalPriceIndicator
+          guarantee {
+            depositRequired
+            nonRefundable
+            isAfterCxlDeadline
+          }
+          ratePlan {
+            attributes
+            commissionable
+            confidentialRates
+            ratePlanName
+            ratePlanDesc
+            hhonorsMembershipRequired
+            serviceChargesAndTaxesIncluded
+            specialRateType
+          }
+          serviceChargeDesc: serviceChargeDetails
+        }
+        packageRates {
+          confUpgradeAvailable
+          roomTypeCode
+          rateAmount
+          rateAmountFmt(decimal: 0, strategy: ceiling)
+          rateAmountUSD: rateAmount(currencyCode: "USD")
+          amountAfterTaxFmt(decimal: 0, strategy: ceiling)
+          fullAmountAfterTax: amountAfterTaxFmt
+          rateChangeIndicator
+          feeTransparencyIndicator
+          cmaTotalPriceIndicator
+          ratePlanCode
+          ratePlan {
+            attributes
+            commissionable
+            confidentialRates
+            ratePlanName
+            ratePlanDesc
+            ratePlanCode
+            hhonorsMembershipRequired
+            serviceChargesAndTaxesIncluded
+            specialRateType
+          }
+          guarantee {
+            guarPolicyCode
+            cxlPolicyCode
+            depositRequired
+            nonRefundable
+            isAfterCxlDeadline
+          }
+          serviceChargeDesc: serviceChargeDetails
+        }
+        redemptionRoomRates(first: 1) {
+          confUpgradeAvailable
+          cashRatePlan
+          rateChangeIndicator
+          pointDetails(perNight: true) {
+            effectiveDateFmt(format: "medium", language: $language)
+            effectiveDateFmtAda: effectiveDateFmt(format: "long", language: $language)
+            pointsRate
+            pointsRateFmt
+          }
+          sufficientPoints
+          pamEligibleRoomRate {
+            ratePlan {
+              ratePlanCode
+              rateCategoryToken
+            }
+            roomTypeCode
+          }
+          roomTypeCode
+          ratePlan {
+            ratePlanDesc
+            ratePlanName
+            redemptionType
+          }
+          ratePlanCode
+          totalCostPoints
+          totalCostPointsFmt
+          guarantee {
+            depositRequired
+            nonRefundable
+            isAfterCxlDeadline
+          }
+        }
+      }
+      lowestPointsInc
+    }
+  }
+}

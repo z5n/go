@@ -1,6 +1,9 @@
 import {
-  setupDatePickers,
-  refreshDatePickers,
+  setupDateRangesField,
+  getDateRanges,
+  setDateRanges,
+  formatRangeLabel,
+  nightsBetween,
 } from "./calendar.js";
 
 const $ = (id) => document.getElementById(id);
@@ -47,13 +50,23 @@ const state = {
   scanErrors: [],
   awaitingReauth: false,
   userName: null,
+  pageSize: 25,
+  focusCtyhocn: null,
+  focusHotelName: null,
+  page: 0,
   roomFetchPending: [],
   roomFetchInFlight: 0,
   refreshingKeys: new Set(),
+  /** Hotels in the active destination scan — used for status “Found N hotels”. */
+  scanHotels: [],
+  /** Monotonic SCAN_PROGRESS cursor — ignore out-of-order snapshots. */
+  scanProgressDone: 0,
 };
 
 const RECENT_SEARCHES_KEY = "recentSearches";
+const ROOM_DETAILS_KEY = "roomDetailsCache";
 const MAX_RECENT_SEARCHES = 8;
+const MAX_ROOM_DETAILS = 80;
 const ROOM_FETCH_CONCURRENCY = 1;
 const ROOM_FETCH_DELAY_MS = 750;
 const SCAN_DELAY_MS = 1000;
@@ -79,28 +92,95 @@ function addDaysISO(iso, days) {
   return formatLocalISO(d);
 }
 
+function parseRangesParam(raw) {
+  if (!raw) return [];
+  return String(raw)
+    .split(",")
+    .map((part) => {
+      const [from, to] = part.split("_");
+      if (!from || !to) return null;
+      return { from, to };
+    })
+    .filter(Boolean);
+}
+
+function encodeRangesParam(ranges) {
+  return (ranges || [])
+    .map((r) => `${r.from}_${r.to}`)
+    .filter(Boolean)
+    .join(",");
+}
+
+function formatRangesSummary(ranges) {
+  const list = Array.isArray(ranges) ? ranges : [];
+  if (!list.length) return "any stays";
+  if (list.length === 1) return formatRangeLabel(list[0].from, list[0].to);
+  const nights = [...new Set(list.map((r) => Number(r.nights) || nightsBetween(r.from, r.to)))];
+  if (nights.length === 1) {
+    const n = nights[0];
+    return `${list.length} × ${n === 1 ? "1-night" : `${n}-night`} stays`;
+  }
+  return `${list.length} stays`;
+}
+
+function enrichRanges(ranges) {
+  return (ranges || [])
+    .map((r) => {
+      const from = r.from || r.fromDate;
+      const to = r.to || r.toDate;
+      if (!from || !to) return null;
+      return { from, to, nights: nightsBetween(from, to) };
+    })
+    .filter(Boolean);
+}
+
+function parseMinRooms(value, fallback = 1) {
+  if (value === "" || value == null) return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(9, Math.floor(n)));
+}
+
 function readParams() {
   const params = new URLSearchParams(location.search);
+  const legacyFrom = params.get("from") || params.get("date") || "";
+  const legacyTo = params.get("to") || "";
+  const legacyNights = Number(params.get("nights") || 0);
+  let ranges = parseRangesParam(params.get("ranges") || "");
+  if (!ranges.length && legacyFrom) {
+    const to =
+      legacyTo ||
+      (legacyNights > 0 ? addDaysISO(legacyFrom, legacyNights) : addDaysISO(legacyFrom, 1));
+    ranges = [{ from: legacyFrom, to }];
+  }
   return {
     destination: params.get("destination") || params.get("destinations") || "",
-    fromDate: params.get("from") || params.get("date") || "",
-    toDate: params.get("to") || "",
-    nights: Number(params.get("nights") || 1),
+    ranges,
+    fromDate: ranges[0]?.from || legacyFrom || "",
+    toDate: ranges[0]?.to || legacyTo || "",
     maxRate: params.get("max_rate") || params.get("max_fees") || "",
-    minRooms: Number(params.get("min_rooms") || params.get("min_seats") || 1),
+    minRooms: parseMinRooms(params.get("min_rooms") ?? params.get("min_seats"), 1),
     rateType: params.get("rate_type") || "fnf",
+    ctyhocn: String(params.get("ctyhocn") || "").toUpperCase(),
+    hotel: params.get("hotel") || "",
   };
 }
 
 function writeParams(values) {
   const params = new URLSearchParams();
   if (values.destination) params.set("destination", values.destination);
-  if (values.fromDate) params.set("date", values.fromDate);
-  if (values.toDate) params.set("to", values.toDate);
-  if (values.nights) params.set("nights", String(values.nights));
+  const ranges = values.ranges?.length
+    ? values.ranges
+    : values.fromDate && values.toDate
+      ? [{ from: values.fromDate, to: values.toDate }]
+      : [];
+  const encoded = encodeRangesParam(ranges);
+  if (encoded) params.set("ranges", encoded);
   if (values.maxRate !== "" && values.maxRate != null) params.set("max_rate", String(values.maxRate));
-  if (values.minRooms) params.set("min_rooms", String(values.minRooms));
+  if (values.minRooms != null && values.minRooms !== "") params.set("min_rooms", String(values.minRooms));
   params.set("rate_type", values.rateType);
+  if (values.ctyhocn) params.set("ctyhocn", String(values.ctyhocn).toUpperCase());
+  if (values.hotel) params.set("hotel", String(values.hotel));
   history.replaceState(null, "", `${location.pathname}?${params.toString()}`);
 }
 
@@ -191,6 +271,8 @@ function sendMessage(message) {
 }
 
 function setupMetricsSession() {
+  // Open Search tab = active metrics session (Metrics page shows "current").
+  // Ends only when the tab unloads — not when a scan finishes.
   sendMessage({ type: "METRICS_SESSION_START", sessionId: METRICS_SESSION_ID });
   const end = () => {
     try {
@@ -207,17 +289,20 @@ function setupMetricsSession() {
 }
 
 function formValues() {
-  const nightsRaw = $("nights").value;
   const rateType = $("rateType")?.value === "tm" ? "tm" : "fnf";
+  const ranges = enrichRanges(getDateRanges());
   return {
     destination: $("destination").value.trim(),
-    fromDate: $("fromDate").value,
-    toDate: $("toDate").value,
-    nights: nightsRaw === "" ? null : Number(nightsRaw || 1),
+    ranges,
+    fromDate: ranges[0]?.from || "",
+    toDate: ranges[0]?.to || "",
+    nights: ranges[0]?.nights || null,
     maxRate: $("maxRate").value === "" ? null : Number($("maxRate").value),
-    minRooms: Number($("minRooms").value || 1),
+    minRooms: parseMinRooms($("minRooms").value, 1),
     goOnly: false,
     rateType,
+    ctyhocn: state.focusCtyhocn || "",
+    hotel: state.focusHotelName || "",
   };
 }
 
@@ -307,10 +392,13 @@ function formatMoneyAmount(amount, currency, amountFmt = null) {
 }
 
 function stayNightsFor(row) {
+  if (row?.arrivalDate && row?.departureDate) {
+    return nightsBetween(row.arrivalDate, row.departureDate);
+  }
   const fromRow = Number(row?.nights);
   if (Number.isFinite(fromRow) && fromRow > 0) return fromRow;
-  const fromForm = Number($("nights")?.value);
-  if (Number.isFinite(fromForm) && fromForm > 0) return fromForm;
+  const values = formValues();
+  if (values.nights) return values.nights;
   return 1;
 }
 
@@ -754,6 +842,7 @@ function syncColumnFilterFromDom(id) {
   state.columnFilters[id] = new Set(
     [...list.querySelectorAll("input[type=checkbox]:checked")].map((el) => el.value)
   );
+  state.page = 0;
   // Defer rebuild so we don't remove the checkbox mid-click (which cancels the toggle
   // / retargets the click to document and makes options feel dead).
   requestAnimationFrame(() => refreshTable());
@@ -837,6 +926,7 @@ function setupColumnFilters() {
     reset.addEventListener("click", (e) => {
       e.stopPropagation();
       state.columnFilters[def.id] = new Set();
+      state.page = 0;
       requestAnimationFrame(() => refreshTable());
     });
   }
@@ -869,6 +959,7 @@ function syncDowFromDom() {
     [...$("dowDays").querySelectorAll("input[type=checkbox]:checked")].map((el) => Number(el.value))
   );
   updateDowUi();
+  state.page = 0;
   refreshTable();
 }
 
@@ -966,6 +1057,7 @@ function setupDowFilter() {
     e.stopPropagation();
     state.dowSelected = new Set();
     updateDowUi();
+    state.page = 0;
     refreshTable();
   });
   document.addEventListener("click", () => {
@@ -999,28 +1091,29 @@ function stayKey(row) {
   ].join("|");
 }
 
+/** Room-shop cache key: hotel + stay + rate program (not amount/plan — those change during scans). */
+function roomDetailKey(row, friendsAndFamily = formValues().rateType !== "tm") {
+  const stay = stayDatesForRoomFetch(row);
+  const arrival = stay?.arrivalDate || row?.arrivalDate || "";
+  const departure = stay?.departureDate || row?.departureDate || "";
+  const hotel = String(row?.ctyhocn || "").toUpperCase();
+  return `${hotel}|${arrival}|${departure}|${friendsAndFamily ? "fnf" : "tm"}`;
+}
+
+function isStayExpanded(row) {
+  const detailKey = roomDetailKey(row);
+  for (const r of state.allRows) {
+    if (roomDetailKey(r) === detailKey && state.expanded.has(rowKey(r))) return true;
+  }
+  return false;
+}
+
 function migrateRowKeyState(oldKey, newKey) {
   if (!oldKey || !newKey || oldKey === newKey) return;
-  for (const set of [
-    state.expanded,
-    state.refreshingKeys,
-    state.roomsSectionOpen,
-  ]) {
+  for (const set of [state.expanded, state.refreshingKeys]) {
     if (set.has(oldKey)) {
       set.delete(oldKey);
       set.add(newKey);
-    }
-  }
-  if (state.roomDetails.has(oldKey)) {
-    state.roomDetails.set(newKey, state.roomDetails.get(oldKey));
-    state.roomDetails.delete(oldKey);
-  }
-  for (const set of [state.roomGroupsOpen, state.roomDescOpen]) {
-    for (const id of [...set]) {
-      if (id.startsWith(`${oldKey}::`)) {
-        set.delete(id);
-        set.add(`${newKey}::${id.slice(oldKey.length + 2)}`);
-      }
     }
   }
 }
@@ -1126,14 +1219,12 @@ async function refreshCachedEntry(key) {
       // Night disappeared from calendar — drop it.
       const old = rowKey(existing);
       state.expanded.delete(old);
-      state.roomDetails.delete(old);
-      state.roomsSectionOpen.delete(old);
       continue;
     }
     // Re-apply current search filters to refreshed day.
     if (values.goOnly && !fresh.isGoRate) continue;
     if (values.maxRate != null && Number(fresh.amount) > Number(values.maxRate)) continue;
-    if ((fresh.roomsAvail ?? 0) < Number(values.minRooms || 1)) continue;
+    if ((fresh.roomsAvail ?? 0) < Number(values.minRooms ?? 1)) continue;
 
     const oldKey = rowKey(existing);
     const merged = {
@@ -1156,17 +1247,19 @@ async function refreshCachedEntry(key) {
   const updated =
     state.allRows.find((r) => stayKey(r) === refreshedStay) || null;
   if (updated) {
-    const newKey = rowKey(updated);
+    const detailKey = roomDetailKey(updated);
     if (!res.roomsError) {
-      state.roomDetails.set(newKey, {
+      state.roomDetails.set(detailKey, {
         status: "ok",
         rooms: res.rooms || [],
         fromCache: false,
         currency: res.currency || null,
+        savedAt: Date.now(),
       });
+      schedulePersistRoomDetails();
     } else {
-      state.roomDetails.delete(newKey);
-      enqueueRoomRateFetch(newKey, updated, { priority: true });
+      state.roomDetails.delete(detailKey);
+      enqueueRoomRateFetch(updated, { priority: true });
     }
   }
 
@@ -1272,14 +1365,19 @@ function roomsSectionHeading(key, label, { toggleable = false, open = true } = {
 }
 
 function roomsSectionHtml(key, row) {
-  const detail = state.roomDetails.get(key);
+  const detailKey = roomDetailKey(row);
+  const detail = state.roomDetails.get(detailKey);
   const stay = stayDatesForRoomFetch(row);
   const inventoryNote = row.inventoryOnly
     ? `<div class="inventory-rooms-note">${escapeHtml(COUNTRY_ROOMS_HINT)}</div>`
     : "";
-  if (!detail || detail.status === "loading" || detail.status === "queued") {
+  const rooms = detail?.rooms || [];
+  // Keep previously loaded rooms visible (incl. F&F compares) — never flash Loading again.
+  if (detail?.status === "ok" || rooms.length) {
+    /* fall through to render rooms / empty */
+  } else if (!detail || detail.status === "loading" || detail.status === "queued") {
     return `<div class="rooms-section">${inventoryNote}${roomsSectionHeading(
-      key,
+      detailKey,
       "Available rooms"
     )}<div class="rooms-status">${
       row.inventoryOnly
@@ -1287,23 +1385,22 @@ function roomsSectionHtml(key, row) {
         : "Loading room rates for this stay…"
     }</div></div>`;
   }
-  if (detail.status === "error") {
+  if (detail?.status === "error" && !rooms.length) {
     return `<div class="rooms-section">${inventoryNote}${roomsSectionHeading(
-      key,
+      detailKey,
       "Available rooms"
     )}<div class="rooms-status bad">${escapeHtml(
       detail.error || "Could not load rooms."
     )}</div></div>`;
   }
-  const rooms = detail.rooms || [];
   if (!rooms.length) {
     return `<div class="rooms-section">${inventoryNote}${roomsSectionHeading(
-      key,
+      detailKey,
       "Available rooms"
     )}<div class="rooms-status">No room rates returned for this stay.</div></div>`;
   }
-  const cacheNote = detail.fromCache ? ` · cached` : "";
-  const open = isRoomsSectionOpen(key);
+  const cacheNote = detail?.fromCache ? ` · cached` : "";
+  const open = isRoomsSectionOpen(detailKey);
   const arrivalDate = stay?.arrivalDate || row.arrivalDate;
   const departureDate = stay?.departureDate || row.departureDate;
   const bookUrl = `https://www.hilton.com/en/book/reservation/rooms/?ctyhocn=${encodeURIComponent(
@@ -1314,16 +1411,16 @@ function roomsSectionHtml(key, row) {
   const groups = sortedRoomGroups(rooms);
   const title = `Available rooms (${rooms.length} prices · ${groups.length} types${cacheNote})`;
   if (!open) {
-    return `<div class="rooms-section collapsed">${inventoryNote}${roomsSectionHeading(key, title, {
+    return `<div class="rooms-section collapsed">${inventoryNote}${roomsSectionHeading(detailKey, title, {
       toggleable: true,
       open: false,
     })}</div>`;
   }
   const nights = stay?.nights ?? stayNightsFor(row);
-  const currency = row.currency || detail.currency;
+  const currency = row.currency || detail?.currency;
   const rowsHtml = groups
     .map((group) => {
-      const openGroup = isRoomGroupOpen(key, group.code);
+      const openGroup = isRoomGroupOpen(detailKey, group.code);
       const cheapest = group.rooms.reduce((best, room) => {
         if (room.amount == null) return best;
         if (!best || Number(room.amount) < Number(best.amount)) return room;
@@ -1349,10 +1446,10 @@ function roomsSectionHtml(key, row) {
       const groupTitle = showCode
         ? `${escapeHtml(displayName)} <span class="room-group-code">${escapeHtml(group.code)}</span>`
         : escapeHtml(displayName);
-      const descParts = roomGroupDescriptionParts(key, group);
+      const descParts = roomGroupDescriptionParts(detailKey, group);
       const header = `<tr
         class="room-group-row${openGroup ? " open" : ""}"
-        data-stay-key="${escapeHtml(key)}"
+        data-stay-key="${escapeHtml(detailKey)}"
         data-room-code="${escapeHtml(group.code)}"
         tabindex="0"
         role="button"
@@ -1405,7 +1502,7 @@ function roomsSectionHtml(key, row) {
     })
     .join("");
   return `<div class="rooms-section">
-    ${roomsSectionHeading(key, title, { toggleable: true, open: true })}
+    ${roomsSectionHeading(detailKey, title, { toggleable: true, open: true })}
     <div class="rooms-body">
       <table class="rooms-table">
         <thead>
@@ -1423,16 +1520,20 @@ function roomsSectionHtml(key, row) {
   </div>`;
 }
 
-async function loadRoomRates(key, row) {
-  if (!row?.ctyhocn) return;
+async function loadRoomRates(detailKey, row) {
+  if (!row?.ctyhocn || !detailKey) return;
   const stay = stayDatesForRoomFetch(row);
   if (!stay) return;
-  const existing = state.roomDetails.get(key);
+  const existing = state.roomDetails.get(detailKey);
   if (existing?.status === "loading" || existing?.status === "ok") return;
 
-  state.roomDetails.set(key, { status: "loading", rooms: [] });
-  // Only paint a loading state when the detail panel is open.
-  if (state.expanded.has(key)) refreshTable();
+  state.roomDetails.set(detailKey, {
+    status: "loading",
+    rooms: existing?.rooms || [],
+    fromCache: existing?.fromCache,
+    currency: existing?.currency || null,
+  });
+  if (isStayExpanded(row)) refreshTable();
 
   const values = formValues();
   const res = await sendMessage({
@@ -1443,40 +1544,187 @@ async function loadRoomRates(key, row) {
     friendsAndFamily: values.rateType !== "tm",
   });
 
-  // Always keep results so F&F "vs / save" can show on the main price cell
-  // even when the rooms dropdown is still collapsed.
+  // Keep results so F&F "vs / save" stays on the main price cell after collapse.
   if (!res.ok) {
     if (res.unauthorized) {
       markUnauthorized(res.error);
-      state.roomDetails.set(key, {
+      state.roomDetails.set(detailKey, {
         status: "error",
         error: res.error || "Session expired.",
-        rooms: [],
+        rooms: existing?.rooms || [],
       });
     } else {
-      state.roomDetails.set(key, {
+      state.roomDetails.set(detailKey, {
         status: "error",
         error: res.error || "Room shop failed.",
-        rooms: [],
+        rooms: existing?.rooms || [],
       });
     }
-  } else {
-    state.roomDetails.set(key, {
+    refreshTable();
+    return;
+  }
+
+  state.roomDetails.set(detailKey, {
+    status: "ok",
+    rooms: res.rooms || [],
+    fromCache: Boolean(res.fromCache),
+    currency: res.currency || null,
+    savedAt: Date.now(),
+  });
+  schedulePersistRoomDetails();
+  refreshTable();
+}
+
+let persistRoomDetailsTimer = null;
+
+function schedulePersistRoomDetails() {
+  if (persistRoomDetailsTimer) return;
+  persistRoomDetailsTimer = setTimeout(() => {
+    persistRoomDetailsTimer = null;
+    persistRoomDetails().catch(() => {});
+  }, 300);
+}
+
+async function persistRoomDetails() {
+  const entries = [];
+  for (const [key, detail] of state.roomDetails) {
+    if (detail?.status !== "ok" || !Array.isArray(detail.rooms) || !detail.rooms.length) continue;
+    entries.push({
+      key,
+      savedAt: Number(detail.savedAt) || Date.now(),
       status: "ok",
-      rooms: res.rooms || [],
-      fromCache: Boolean(res.fromCache),
-      currency: res.currency || null,
+      rooms: detail.rooms,
+      fromCache: Boolean(detail.fromCache),
+      currency: detail.currency || null,
     });
   }
-  refreshTable();
+  entries.sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+  const trimmed = entries.slice(0, MAX_ROOM_DETAILS);
+  const map = {};
+  for (const entry of trimmed) {
+    map[entry.key] = {
+      status: "ok",
+      rooms: entry.rooms,
+      fromCache: entry.fromCache,
+      currency: entry.currency,
+      savedAt: entry.savedAt,
+    };
+  }
+  await storageSet({ [ROOM_DETAILS_KEY]: map });
+}
+
+async function loadPersistedRoomDetails() {
+  const data = await storageGet([ROOM_DETAILS_KEY]);
+  const map = data[ROOM_DETAILS_KEY];
+  if (!map || typeof map !== "object") return;
+  for (const [key, detail] of Object.entries(map)) {
+    if (!detail?.rooms?.length) continue;
+    if (state.roomDetails.has(key) && state.roomDetails.get(key)?.status === "ok") continue;
+    state.roomDetails.set(key, {
+      status: "ok",
+      rooms: detail.rooms,
+      fromCache: Boolean(detail.fromCache),
+      currency: detail.currency || null,
+      savedAt: Number(detail.savedAt) || Date.now(),
+    });
+  }
+}
+
+const ROOM_CACHE_LOOKUP_BATCH = 250;
+let hydrateFnfTimer = null;
+let hydrateFnfToken = 0;
+
+/** Apply F&F compares for stays that already have shopAvail in the local room cache (no Hilton calls). */
+function scheduleHydrateFnfComparesFromCache() {
+  if (state.scanning) return;
+  if (hydrateFnfTimer) clearTimeout(hydrateFnfTimer);
+  hydrateFnfTimer = setTimeout(() => {
+    hydrateFnfTimer = null;
+    hydrateFnfComparesFromCache(state.allRows).catch(() => {});
+  }, 40);
+}
+
+async function hydrateFnfComparesFromCache(rows) {
+  const values = formValues();
+  if (values.rateType === "tm") return;
+  const friendsAndFamily = true;
+  const token = ++hydrateFnfToken;
+  const stays = [];
+  const seen = new Set();
+  for (const row of rows || []) {
+    if (!row?.ctyhocn || row.error) continue;
+    if (row.inventoryOnly && !row.stayPriced) continue;
+    if (!isFamilyAndFriendsRate(row)) continue;
+    const detailKey = roomDetailKey(row, friendsAndFamily);
+    if (seen.has(detailKey)) continue;
+    seen.add(detailKey);
+    const existing = state.roomDetails.get(detailKey);
+    if (existing?.status === "ok" && existing.rooms?.length) continue;
+    const stay = stayDatesForRoomFetch(row);
+    if (!stay?.arrivalDate || !stay?.departureDate) continue;
+    stays.push({
+      key: detailKey,
+      ctyhocn: String(row.ctyhocn).toUpperCase(),
+      arrivalDate: stay.arrivalDate,
+      departureDate: stay.departureDate,
+      friendsAndFamily,
+    });
+  }
+  if (!stays.length) return;
+
+  let applied = 0;
+  for (let i = 0; i < stays.length; i += ROOM_CACHE_LOOKUP_BATCH) {
+    if (token !== hydrateFnfToken || state.scanning) return;
+    const chunk = stays.slice(i, i + ROOM_CACHE_LOOKUP_BATCH);
+    const res = await sendMessage({
+      type: "LOOKUP_CACHED_ROOM_RATES",
+      stays: chunk.map(({ ctyhocn, arrivalDate, departureDate, friendsAndFamily: fnf }) => ({
+        ctyhocn,
+        arrivalDate,
+        departureDate,
+        friendsAndFamily: fnf,
+      })),
+    });
+    if (token !== hydrateFnfToken || !res?.ok || !Array.isArray(res.results)) return;
+    for (let j = 0; j < chunk.length; j += 1) {
+      const hit = res.results[j];
+      if (!hit?.rooms?.length) continue;
+      const { key } = chunk[j];
+      const existing = state.roomDetails.get(key);
+      if (existing?.status === "ok" && existing.rooms?.length) continue;
+      state.roomDetails.set(key, {
+        status: "ok",
+        rooms: hit.rooms,
+        fromCache: true,
+        currency: hit.currency || null,
+        savedAt: Date.now(),
+      });
+      applied += 1;
+    }
+  }
+  if (applied > 0 && token === hydrateFnfToken) {
+    schedulePersistRoomDetails();
+    refreshTable();
+  }
 }
 
 function clearRoomFetchQueue() {
   state.roomFetchPending = [];
+  for (const [key, detail] of [...state.roomDetails.entries()]) {
+    if (detail?.status === "queued") {
+      if (detail.rooms?.length) {
+        state.roomDetails.set(key, { ...detail, status: "ok" });
+      } else {
+        state.roomDetails.delete(key);
+      }
+    }
+  }
 }
 
-function enqueueRoomRateFetch(key, row, { priority = false } = {}) {
-  const existing = state.roomDetails.get(key);
+function enqueueRoomRateFetch(row, { priority = false } = {}) {
+  if (!row?.ctyhocn) return;
+  const detailKey = roomDetailKey(row);
+  const existing = state.roomDetails.get(detailKey);
   if (
     existing?.status === "ok" ||
     existing?.status === "loading" ||
@@ -1484,8 +1732,13 @@ function enqueueRoomRateFetch(key, row, { priority = false } = {}) {
   ) {
     return;
   }
-  state.roomDetails.set(key, { status: "queued", rooms: [] });
-  const item = { key, row };
+  state.roomDetails.set(detailKey, {
+    status: "queued",
+    rooms: existing?.rooms || [],
+    fromCache: existing?.fromCache,
+    currency: existing?.currency || null,
+  });
+  const item = { key: detailKey, row };
   if (priority) state.roomFetchPending.unshift(item);
   else state.roomFetchPending.push(item);
   pumpRoomFetches();
@@ -1507,17 +1760,6 @@ function pumpRoomFetches() {
         state.roomFetchInFlight = Math.max(0, state.roomFetchInFlight - 1);
         pumpRoomFetches();
       });
-  }
-}
-
-/** Prefetch shop rooms as soon as calendar entries land (for F&F compare + expand). */
-function prefetchRoomRatesForRows(rows) {
-  const list = Array.isArray(rows) ? rows : [];
-  for (const row of list) {
-    if (!row || row.error || row.inventoryOnly) continue;
-    if (!row.arrivalDate || !row.departureDate) continue;
-    const key = rowKey(row);
-    enqueueRoomRateFetch(key, row, { priority: isFamilyAndFriendsRate(row) });
   }
 }
 
@@ -1549,6 +1791,11 @@ function inventoryRowsFromHotels(hotels) {
         )}`,
       };
     });
+}
+
+/** Rate matches / errors from the in-flight scan only (no unscanned placeholders). */
+function rowsForScanProgress(rateRows) {
+  return Array.isArray(rateRows) ? rateRows : [];
 }
 
 /** Hilton prices its results page 20 hotels at a time — mirror that batch size. */
@@ -1602,10 +1849,11 @@ function applyInventoryRates(rates, { arrivalDate, departureDate, nights }) {
  */
 async function populateInventoryRates(placeLabel) {
   const values = formValues();
-  const arrivalDate = values.fromDate;
+  const stay = values.ranges?.[0];
+  const arrivalDate = stay?.from || values.fromDate;
   if (!arrivalDate) return;
-  const nights = Math.max(1, Number(values.nights) || 1);
-  const departureDate = addDaysISO(arrivalDate, nights);
+  const nights = Math.max(1, Number(stay?.nights || values.nights) || 1);
+  const departureDate = stay?.to || addDaysISO(arrivalDate, nights);
   const friendsAndFamily = values.rateType !== "tm";
 
   const codes = [
@@ -1619,7 +1867,7 @@ async function populateInventoryRates(placeLabel) {
   let failed = 0;
   for (let i = 0; i < total; i += INVENTORY_RATE_PAGE_SIZE) {
     if (state.stopRequested) {
-      setStatus(`Stopped. ${priced} of ${total} hotels priced in ${placeLabel}.`, "warn");
+      setStatus(`Stopped. ${formatCount(priced)} of ${formatCount(total)} hotels priced in ${placeLabel}.`, "warn");
       return;
     }
     const page = codes.slice(i, i + INVENTORY_RATE_PAGE_SIZE);
@@ -1633,7 +1881,7 @@ async function populateInventoryRates(placeLabel) {
       friendsAndFamily,
     });
     if (res?.cancelled || state.stopRequested) {
-      setStatus(`Stopped. ${priced} of ${total} hotels priced in ${placeLabel}.`, "warn");
+      setStatus(`Stopped. ${formatCount(priced)} of ${formatCount(total)} hotels priced in ${placeLabel}.`, "warn");
       return;
     }
     if (res?.unauthorized) {
@@ -1649,14 +1897,14 @@ async function populateInventoryRates(placeLabel) {
     done += page.length;
     setProgress((done / total) * 100);
     setStatus(
-      `${placeLabel}: priced ${priced} of ${total} hotels for ${arrivalDate} → ${departureDate}…`
+      `${placeLabel}: priced ${formatCount(priced)} of ${formatCount(total)} hotels for ${arrivalDate} → ${departureDate}…`
     );
   }
 
-  const failBit = failed ? ` · ${failed} hotel(s) failed to price` : "";
+  const failBit = failed ? ` · ${formatCount(failed)} hotel(s) failed to price` : "";
   setProgress(100);
   setStatus(
-    `Done. ${total} hotels in ${placeLabel} · ${priced} priced for ${nightsLabel(nights)} from ${arrivalDate}${failBit}. ${COUNTRY_ROOMS_HINT}`,
+    `Done. ${formatCount(total)} hotels in ${placeLabel} · ${formatCount(priced)} priced for ${nightsLabel(nights)} from ${arrivalDate}${failBit}. ${COUNTRY_ROOMS_HINT}`,
     failed ? "warn" : ""
   );
 }
@@ -1687,12 +1935,13 @@ function stayDatesForRoomFetch(row) {
   }
   if (!row?.inventoryOnly) return null;
   const values = formValues();
-  const arrivalDate = values.fromDate;
+  const stay = values.ranges?.[0];
+  const arrivalDate = stay?.from || values.fromDate;
   if (!arrivalDate) return null;
-  const nights = Math.max(1, Number(values.nights) || 1);
+  const nights = Math.max(1, Number(stay?.nights || values.nights) || 1);
   return {
     arrivalDate,
-    departureDate: addDaysISO(arrivalDate, nights),
+    departureDate: stay?.to || addDaysISO(arrivalDate, nights),
     nights,
   };
 }
@@ -1707,11 +1956,17 @@ function toggleExpanded(key) {
     return;
   }
   state.expanded.add(key);
-  refreshTable();
   const row =
     state.rows.find((r) => rowKey(r) === key) ||
     state.allRows.find((r) => rowKey(r) === key);
-  if (row) enqueueRoomRateFetch(key, row, { priority: true });
+  if (row) {
+    const detail = state.roomDetails.get(roomDetailKey(row));
+    // Already have rooms — keep them (and F&F compare) without reloading.
+    if (!(detail?.status === "ok" && detail.rooms?.length)) {
+      enqueueRoomRateFetch(row, { priority: true });
+    }
+  }
+  refreshTable();
 }
 
 function summarizeScanErrors(errors) {
@@ -1761,14 +2016,113 @@ function uniqueHotelCount(rows) {
   ).size;
 }
 
+function formatCount(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "0";
+  return Math.trunc(n).toLocaleString("en-US");
+}
+
 function resultsCountLabel(visibleRows, { totalRows = null, filtersActive = false } = {}) {
-  const stays = (visibleRows || []).length;
-  const hotels = uniqueHotelCount(visibleRows);
-  const staysBit =
+  const list = visibleRows || [];
+  const priced = list.filter((r) => !r.inventoryOnly);
+  const stays = priced.length;
+  const hotels = uniqueHotelCount(priced.length ? priced : list);
+  const cached = priced.filter((r) => r.fromCache).length;
+  if (!priced.length && hotels) {
+    return `${formatCount(hotels)} hotel${hotels === 1 ? "" : "s"}`;
+  }
+  if (!priced.length) {
+    return "0 stays • 0 hotels matching";
+  }
+  const staysCore =
     filtersActive && totalRows != null && stays !== totalRows
-      ? `${stays} of ${totalRows} stays`
-      : `${stays} stay${stays === 1 ? "" : "s"}`;
-  return `${staysBit} • ${hotels} hotel${hotels === 1 ? "" : "s"}`;
+      ? `${formatCount(stays)} of ${formatCount(totalRows)} stays`
+      : `${formatCount(stays)} stay${stays === 1 ? "" : "s"}`;
+  const cacheBit = cached > 0 ? ` (${formatCount(cached)} from cache)` : "";
+  return `${staysCore}${cacheBit} • ${formatCount(hotels)} hotel${hotels === 1 ? "" : "s"} matching`;
+}
+
+function totalPagesFor(rowCount) {
+  const size = Math.max(1, Number(state.pageSize) || 25);
+  return Math.max(1, Math.ceil(Math.max(0, rowCount) / size));
+}
+
+function clampResultsPage(rowCount) {
+  const totalPages = totalPagesFor(rowCount);
+  if (state.page >= totalPages) state.page = totalPages - 1;
+  if (state.page < 0) state.page = 0;
+  return totalPages;
+}
+
+function pageRows(rows) {
+  const list = rows || [];
+  clampResultsPage(list.length);
+  const size = Math.max(1, Number(state.pageSize) || 25);
+  const start = state.page * size;
+  return list.slice(start, start + size);
+}
+
+function updatePagerUi(rowCount) {
+  const pager = $("resultsPager");
+  const prev = $("pagePrev");
+  const next = $("pageNext");
+  const meta = $("pageMeta");
+  const rangeLabel = $("pageRangeLabel");
+  const totalLabel = $("pageTotalLabel");
+  const pageJump = $("pageJump");
+  const sizeSelect = $("pageSize");
+  if (!pager || !prev || !next || !meta) return;
+
+  if (sizeSelect && String(sizeSelect.value) !== String(state.pageSize)) {
+    sizeSelect.value = String(state.pageSize);
+  }
+
+  const total = Math.max(0, rowCount || 0);
+  if (!total) {
+    pager.hidden = true;
+    prev.disabled = true;
+    next.disabled = true;
+    if (rangeLabel) rangeLabel.textContent = "";
+    if (totalLabel) totalLabel.textContent = "";
+    if (pageJump) pageJump.value = "";
+    return;
+  }
+
+  pager.hidden = false;
+  const totalPages = clampResultsPage(total);
+  const size = Math.max(1, Number(state.pageSize) || 25);
+  const start = state.page * size + 1;
+  const end = Math.min(total, (state.page + 1) * size);
+  if (rangeLabel) {
+    rangeLabel.textContent = `${formatCount(start)}–${formatCount(end)} of ${formatCount(total)} ·`;
+  }
+  if (totalLabel) totalLabel.textContent = `of ${formatCount(totalPages)}`;
+  if (pageJump) {
+    pageJump.max = String(totalPages);
+    // Don't fight the user while they're typing in this field.
+    if (document.activeElement !== pageJump) {
+      pageJump.value = String(state.page + 1);
+    }
+  }
+  prev.disabled = state.page <= 0;
+  next.disabled = state.page >= totalPages - 1;
+}
+
+function jumpToResultsPage(rawValue) {
+  const totalPages = totalPagesFor(state.rows.length);
+  if (!totalPages || !state.rows.length) return;
+  const parsed = Number.parseInt(String(rawValue ?? "").trim(), 10);
+  if (!Number.isFinite(parsed)) {
+    updatePagerUi(state.rows.length);
+    return;
+  }
+  const nextPage = Math.min(totalPages, Math.max(1, parsed)) - 1;
+  if (nextPage === state.page) {
+    updatePagerUi(state.rows.length);
+    return;
+  }
+  state.page = nextPage;
+  refreshTable();
 }
 
 function refreshTable() {
@@ -1790,7 +2144,7 @@ function refreshTable() {
         ? "No nights match the current filters."
         : "No matching Go rates in range."
       : state.scanErrors.length
-        ? `No matching nights. ${state.scanErrors.length} hotel request(s) failed.`
+        ? `No matching nights. ${formatCount(state.scanErrors.length)} hotel request(s) failed.`
         : "No matching Go rates in range.";
     body.innerHTML = `<tr class="empty"><td colspan="8"><div class="empty-msg">${escapeHtml(
       emptyMsg
@@ -1800,10 +2154,11 @@ function refreshTable() {
           totalRows: state.allRows.length,
           filtersActive: true,
         })
-      : "0 stays • 0 hotels";
+      : "0 stays • 0 hotels matching";
     $("resultsLabel").textContent = state.scanErrors.length
-      ? `${emptyLabel} · ${state.scanErrors.length} failed`
+      ? `${emptyLabel} · ${formatCount(state.scanErrors.length)} failed`
       : emptyLabel;
+    updatePagerUi(0);
     return;
   }
 
@@ -1812,9 +2167,13 @@ function refreshTable() {
     filtersActive,
   });
   $("resultsLabel").textContent = state.scanErrors.length
-    ? `${label} · ${state.scanErrors.length} failed`
+    ? `${label} · ${formatCount(state.scanErrors.length)} failed`
     : label;
-  body.innerHTML = state.rows
+
+  const visible = pageRows(state.rows);
+  updatePagerUi(state.rows.length);
+
+  body.innerHTML = visible
     .map((row) => {
       const key = rowKey(row);
       const open = state.expanded.has(key);
@@ -1825,13 +2184,12 @@ function refreshTable() {
           : `<span class="badge">${escapeHtml(row.specialRateType || "other")}</span>`;
       const cacheIcon = row.inventoryOnly ? "" : cacheIconHtml(row, key);
       const nights = stayNightsFor(row);
-      const detail = state.roomDetails.get(key);
+      const detail = state.roomDetails.get(roomDetailKey(row));
       let mainCompare = null;
       if (
         !row.inventoryOnly &&
         isFamilyAndFriendsRate(row) &&
-        detail?.status === "ok" &&
-        detail.rooms?.length
+        detail?.rooms?.length
       ) {
         const sameType = row.roomTypeCode
           ? detail.rooms.filter(
@@ -1884,12 +2242,14 @@ function refreshTable() {
     .join("");
 }
 
-function renderRows(rows, { syncSession = true } = {}) {
+function renderRows(rows, { syncSession = true, resetPage = false } = {}) {
   const incoming = Array.isArray(rows) ? rows : [];
+  if (resetPage) state.page = 0;
   state.scanErrors = incoming.filter((r) => r.error);
   state.allRows = incoming.filter((r) => !r.error);
   refreshTable();
-  prefetchRoomRatesForRows(state.allRows);
+  // F&F strike-through for stays that already have shopAvail cached locally.
+  if (!state.scanning) scheduleHydrateFnfComparesFromCache();
   if (syncSession && scanErrorsAreUnauthorized(state.scanErrors)) {
     markUnauthorized("Hilton session expired. Sign in again to continue.");
   }
@@ -2008,11 +2368,12 @@ async function persistRecentSearches(list) {
 
 function searchFingerprint(entry) {
   const sug = entry.selectedSuggestion;
+  const rangesKey = (entry.ranges || [])
+    .map((r) => `${r.from}_${r.to}`)
+    .join(",");
   return [
     entry.destination || "",
-    entry.fromDate || "",
-    entry.toDate || "",
-    entry.nights ?? "",
+    rangesKey || `${entry.fromDate || ""}_${entry.toDate || ""}`,
     entry.maxRate ?? "",
     entry.minRooms ?? "",
     entry.rateType || "",
@@ -2027,9 +2388,9 @@ function snapshotFromForm() {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     savedAt: Date.now(),
     destination: values.destination,
+    ranges: values.ranges,
     fromDate: values.fromDate,
     toDate: values.toDate,
-    nights: values.nights,
     maxRate: values.maxRate,
     minRooms: values.minRooms,
     rateType: values.rateType,
@@ -2054,7 +2415,7 @@ async function rememberCurrentSearch() {
   const entry = snapshotFromForm();
   if (!entry.destination) return;
   const cached = /^cached$/i.test(entry.destination) || entry.selectedSuggestion?.type === "cached";
-  if (!cached && (!entry.fromDate || !entry.toDate)) return;
+  if (!cached && !entry.ranges?.length) return;
   const fp = searchFingerprint(entry);
   const next = [entry, ...state.recentSearches.filter((r) => searchFingerprint(r) !== fp)];
   await persistRecentSearches(next);
@@ -2066,11 +2427,15 @@ async function removeRecentSearch(id) {
 
 function formatRecentMeta(entry) {
   const bits = [];
-  if (entry.fromDate && entry.toDate) bits.push(`${entry.fromDate} → ${entry.toDate}`);
-  else if (entry.fromDate) bits.push(`from ${entry.fromDate}`);
-  else if (entry.toDate) bits.push(`to ${entry.toDate}`);
-  if (entry.nights != null && entry.nights !== "") bits.push(nightsLabel(entry.nights));
-  else bits.push("any nights");
+  const ranges =
+    entry.ranges?.length
+      ? entry.ranges
+      : entry.fromDate && entry.toDate
+        ? [{ from: entry.fromDate, to: entry.toDate }]
+        : entry.fromDate && entry.nights
+          ? [{ from: entry.fromDate, to: addDaysISO(entry.fromDate, entry.nights) }]
+          : [];
+  bits.push(formatRangesSummary(ranges));
   if (entry.maxRate != null && entry.maxRate !== "") bits.push(`max ${entry.maxRate}`);
   bits.push(entry.rateType === "tm" ? "Team Member" : "F&F");
   return bits.join(" · ");
@@ -2078,12 +2443,18 @@ function formatRecentMeta(entry) {
 
 function applySearchSnapshot(entry) {
   $("destination").value = entry.destination || "";
-  $("fromDate").value = entry.fromDate || "";
-  $("toDate").value = entry.toDate || "";
-  refreshDatePickers();
-  $("nights").value = entry.nights == null || entry.nights === "" ? "" : String(entry.nights);
+  let ranges =
+    entry.ranges?.length
+      ? entry.ranges
+      : entry.fromDate && entry.toDate
+        ? [{ from: entry.fromDate, to: entry.toDate }]
+        : [];
+  if (!ranges.length && entry.fromDate && entry.nights) {
+    ranges = [{ from: entry.fromDate, to: addDaysISO(entry.fromDate, entry.nights) }];
+  }
+  setDateRanges(ranges);
   $("maxRate").value = entry.maxRate == null || entry.maxRate === "" ? "" : String(entry.maxRate);
-  $("minRooms").value = String(entry.minRooms || 1);
+  $("minRooms").value = String(parseMinRooms(entry.minRooms, 1));
   $("rateType").value = entry.rateType || "fnf";
   updateRateTypeUi();
   state.selectedSuggestion = entry.selectedSuggestion || null;
@@ -2374,11 +2745,13 @@ function setScanningUi(scanning) {
     btn.classList.add("stop-btn");
     btn.setAttribute("aria-label", "Stop search");
   } else {
+    clearRoomFetchQueue();
     btn.type = "submit";
     btn.textContent = "Search";
     btn.classList.remove("stop-btn");
     btn.classList.add("search-btn");
     btn.setAttribute("aria-label", "Search");
+    scheduleHydrateFnfComparesFromCache();
   }
 }
 
@@ -2404,16 +2777,13 @@ async function runSearch(event) {
     setStatus("Destination is required.");
     return;
   }
-  if (!cachedSearch && (!values.fromDate || !values.toDate)) {
-    setStatus("Destination and dates are required.");
+  if (!cachedSearch && !values.ranges?.length) {
+    setStatus("Destination and at least one stay are required.");
     return;
   }
-  if (values.fromDate && values.toDate && values.toDate < values.fromDate) {
-    setStatus("“To” date must be on or after “From”.");
-    return;
-  }
-  if (!cachedSearch && (values.nights == null || values.nights < 1)) {
-    setStatus("Nights must be at least 1.");
+  const tooLong = values.ranges?.find((r) => r.nights > 7);
+  if (tooLong) {
+    setStatus(`Stays can be at most 7 nights (${formatRangeLabel(tooLong.from, tooLong.to)}).`);
     return;
   }
 
@@ -2421,7 +2791,7 @@ async function runSearch(event) {
   rememberCurrentSearch();
   state.stopRequested = false;
   clearRoomFetchQueue();
-  state.roomDetails.clear();
+  // Keep previously fetched room shops so F&F compares and room lists stay available.
   state.expanded.clear();
   state.roomGroupsOpen.clear();
   state.roomsSectionOpen.clear();
@@ -2433,7 +2803,9 @@ async function runSearch(event) {
   setScanningUi(true);
   setProgress(0);
   hideSuggestions();
-  renderRows([]);
+  state.scanHotels = [];
+  state.scanProgressDone = 0;
+  renderRows([], { resetPage: true });
 
   try {
     const status = await sendMessage({ type: "GET_STATUS" });
@@ -2490,49 +2862,75 @@ async function runSearch(event) {
           state: picked.state,
         },
       ];
-      setStatus(`Scanning ${picked.primary}…`);
+      state.scanHotels = hotels;
+      setStatus(`Found 1 hotel. Scanning ${picked.primary}…`);
     } else if (isCachedSuggestion(picked) || /^cached$/i.test(values.destination)) {
-      const nightsBit =
-        values.nights == null ? "any length" : nightsLabel(values.nights);
-      const dateBit =
-        values.fromDate && values.toDate
-          ? `${values.fromDate} → ${values.toDate}`
-          : values.fromDate
-            ? `from ${values.fromDate}`
-            : values.toDate
-              ? `to ${values.toDate}`
-              : "any dates";
-      setStatus(`Searching cached ${nightsBit} stays (${dateBit})…`);
+      const dateBit = formatRangesSummary(values.ranges);
+      setStatus(
+        values.ctyhocn
+          ? `Searching cached stays for ${values.hotel || values.ctyhocn}…`
+          : `Searching cached stays (${dateBit})…`
+      );
       const scanRes = await sendMessage({
         type: "SCAN_CACHED_RATES",
-        fromDate: values.fromDate || null,
-        toDate: values.toDate || null,
-        nights: values.nights,
+        ranges: values.ranges.map((r) => ({
+          from: r.from,
+          to: r.to,
+          nights: r.nights,
+        })),
         friendsAndFamily: values.rateType !== "tm",
         goOnly: values.goOnly,
         maxRate: values.maxRate,
         minRooms: values.minRooms,
+        ctyhocn: values.ctyhocn || null,
       });
       if (state.stopRequested || scanRes.cancelled) {
         renderRows(scanRes.rows || []);
         setStatus(
-          `Stopped. ${(scanRes.rows || []).filter((r) => !r.error).length} cached matches so far.`
+          `Stopped. ${formatCount((scanRes.rows || []).filter((r) => !r.error).length)} cached matches so far.`
         );
         return;
       }
       if (!scanRes.ok) {
         throw new Error(scanRes.error || "Cached search failed");
       }
-      renderRows(scanRes.rows || []);
-      const matched = (scanRes.rows || []).filter((r) => !r.error).length;
-      const hotelsCached = scanRes.hotelsCached || 0;
+      let rows = scanRes.rows || [];
+      if (values.ctyhocn) {
+        const code = String(values.ctyhocn).toUpperCase();
+        rows = rows.filter((r) => String(r.ctyhocn || "").toUpperCase() === code);
+        if (rows.length) {
+          const hotelLabel =
+            COLUMN_FILTERS.find((c) => c.id === "hotelName")?.value(rows[0]) ||
+            rows[0].hotelName ||
+            code;
+          state.columnFilters.hotelName = new Set([hotelLabel]);
+        }
+      }
+      renderRows(rows);
+      if (values.ctyhocn) updateColumnFilterUi("hotelName");
+      const matched = rows.filter((r) => !r.error).length;
+      const hotelsCached = values.ctyhocn
+        ? matched
+          ? 1
+          : 0
+        : uniqueHotelCount(rows.filter((r) => !r.error));
       setProgress(100);
       setStatus(
         matched
-          ? `Done. ${matched} cached rates across ${hotelsCached} hotel${hotelsCached === 1 ? "" : "s"} (local only).`
-          : hotelsCached
-            ? `No matching nights in ${hotelsCached} cached hotel calendar${hotelsCached === 1 ? "" : "s"}.`
-            : "No cached rates yet. Run a normal search first to populate the cache."
+          ? values.ctyhocn
+            ? `Done. ${formatCount(matched)} cached rate${matched === 1 ? "" : "s"} for ${
+                values.hotel || values.ctyhocn
+              }.`
+            : `Done. ${formatCount(matched)} cached rates across ${formatCount(hotelsCached)} hotel${
+                hotelsCached === 1 ? "" : "s"
+              } (local only).`
+          : values.ctyhocn
+            ? `No cached rates for ${values.hotel || values.ctyhocn}.`
+            : hotelsCached
+              ? `No matching nights in ${formatCount(hotelsCached)} cached hotel calendar${
+                  hotelsCached === 1 ? "" : "s"
+                }.`
+              : "No cached rates yet. Run a normal search first to populate the cache."
       );
       return;
     } else {
@@ -2564,8 +2962,16 @@ async function runSearch(event) {
         hotelRes.resolvedSuggestion?.label ||
         destination;
 
+      if (!hotels.length) {
+        setProgress(100);
+        setStatus(`No Hilton hotels in ${placeLabel}.`);
+        renderRows([]);
+        return;
+      }
+
+      state.scanHotels = hotels;
       setStatus(
-        `Found ${hotels.length} hotels for ${placeLabel}. Scanning calendars at a steady pace…`
+        `Found ${formatCount(hotels.length)} hotel${hotels.length === 1 ? "" : "s"} for ${placeLabel}. Scanning calendars…`
       );
     }
 
@@ -2574,16 +2980,23 @@ async function runSearch(event) {
       return;
     }
 
-    setStatus(
-      `Scanning ${nightsLabel(values.nights)} stays with check-in ${values.fromDate} → ${values.toDate}…`
-    );
+    const hotelTotal = state.scanHotels.length || hotels.length;
+    if (hotelTotal) {
+      setStatus(
+        `Found ${formatCount(hotelTotal)} hotel${hotelTotal === 1 ? "" : "s"}. Scanning ${formatRangesSummary(values.ranges)}…`
+      );
+    } else {
+      setStatus(`Scanning ${formatRangesSummary(values.ranges)}…`);
+    }
 
     const scanRes = await sendMessage({
       type: "SCAN_RATES",
       hotels,
-      fromDate: values.fromDate,
-      toDate: values.toDate,
-      nights: values.nights,
+      ranges: values.ranges.map((r) => ({
+        from: r.from,
+        to: r.to,
+        nights: r.nights,
+      })),
       friendsAndFamily: values.rateType !== "tm",
       goOnly: values.goOnly,
       maxRate: values.maxRate,
@@ -2599,6 +3012,7 @@ async function runSearch(event) {
       throw new Error(scanRes.error || "Rate scan failed");
     }
 
+    state.scanHotels = [];
     renderRows(scanRes.rows || []);
     if (scanRes.unauthorized || scanErrorsAreUnauthorized(state.scanErrors)) {
       markUnauthorized(scanRes.error || "Hilton session expired. Sign in again to continue.");
@@ -2608,27 +3022,36 @@ async function runSearch(event) {
     setSession(scanRes.guestId || null, { userName: scanRes.userName || state.userName || null });
     const matchedRows = (scanRes.rows || []).filter((r) => !r.error);
     const matched = matchedRows.length;
+    const matchedHotels = uniqueHotelCount(matchedRows);
     const cachedMatched = matchedRows.filter((r) => r.fromCache).length;
     const failCount = state.scanErrors.length;
-    const cacheBit = cachedMatched > 0 ? ` · ${cachedMatched} from cache` : "";
+    const cacheBit = cachedMatched > 0 ? ` · ${formatCount(cachedMatched)} from cache` : "";
     const failBit = failCount ? ` · ${formatScanErrorStatus(state.scanErrors)}` : "";
     if (scanRes.cancelled || state.stopRequested) {
       setProgress(scanRes.total ? (scanRes.done / scanRes.total) * 100 : 0);
-      setStatus(`Stopped. ${matched} matching hotels so far${cacheBit}${failBit}.`, failCount ? "warn" : "");
+      setStatus(
+        `Stopped. ${formatCount(matchedHotels)} matching hotel${matchedHotels === 1 ? "" : "s"} so far${cacheBit}${failBit}.`,
+        failCount ? "warn" : ""
+      );
     } else if (failCount && !matched) {
       setProgress(100);
       setStatus(`No matching hotels. ${formatScanErrorStatus(state.scanErrors)}`, "warn");
     } else if (failCount) {
       setProgress(100);
-      setStatus(`Done. ${matched} matching hotels${cacheBit}${failBit}.`, "warn");
+      setStatus(
+        `Done. ${formatCount(matchedHotels)} matching hotel${matchedHotels === 1 ? "" : "s"}${cacheBit}${failBit}.`,
+        "warn"
+      );
     } else {
       setProgress(100);
-      setStatus(`Done. ${matched} matching hotels${cacheBit}.`);
+      setStatus(`Done. ${formatCount(matchedHotels)} matching hotel${matchedHotels === 1 ? "" : "s"}${cacheBit}.`);
     }
   } catch (err) {
     setStatus(String(err.message || err));
   } finally {
     state.stopRequested = false;
+    state.scanHotels = [];
+    state.scanProgressDone = 0;
     setScanningUi(false);
   }
 }
@@ -2636,25 +3059,38 @@ async function runSearch(event) {
 chrome.runtime?.onMessage?.addListener((message) => {
   if (message?.type !== "SCAN_PROGRESS" || !message.total) return;
   if (!state.scanning) return;
+  // Cache-hit streaks emit progress with no delay, so multiple snapshots can be
+  // in flight. Applying an older one overwrites newer rows (failed count / cache
+  // icons flicker). Only accept monotonic `done`.
+  const done = Number(message.done) || 0;
+  if (done < state.scanProgressDone) return;
+  state.scanProgressDone = done;
   if (message.unauthorized) {
+    state.scanHotels = [];
     renderRows(message.rows || []);
     markUnauthorized("Hilton session expired. Sign in again to continue.");
     return;
   }
-  setProgress((message.done / message.total) * 100);
-  const matchedRows = Array.isArray(message.rows) ? message.rows.filter((r) => !r.error) : [];
-  const cachedMatched = matchedRows.filter((r) => r.fromCache).length;
-  const cacheBit = cachedMatched > 0 ? ` · ${cachedMatched} from cache` : "";
-  const matchBit = matchedRows.length ? ` · ${matchedRows.length} hotels found` : "";
-  setStatus(`Scanning ${message.hotel}… (${message.done}/${message.total})${matchBit}${cacheBit}`);
+  const pct = message.total
+    ? Math.min(100, Math.round((done / message.total) * 100))
+    : 0;
+  setProgress(pct);
+  const hotelTotal = state.scanHotels.length || message.hotelCount || 0;
+  const foundBit = hotelTotal
+    ? `Found ${formatCount(hotelTotal)} hotel${hotelTotal === 1 ? "" : "s"} · `
+    : "";
+  setStatus(`${foundBit}Scanning ${message.hotel || "…"}… · ${pct}%`);
   if (Array.isArray(message.rows)) {
-    renderRows(message.rows);
+    renderRows(rowsForScanProgress(message.rows));
   }
 });
 
 function setupClearableDateFields() {
-  // Dates use the custom calendar picker; clearing is via the panel "Clear" control.
-  setupDatePickers(["fromDate", "toDate"]);
+  setupDateRangesField("dateRanges", {
+    onChange() {
+      writeParams(formValues());
+    },
+  });
 }
 
 async function boot() {
@@ -2664,17 +3100,28 @@ async function boot() {
   setupClearableDateFields();
   $("destination").value = "";
   state.selectedSuggestion = null;
-  $("fromDate").value = start;
-  $("toDate").value = end;
-  refreshDatePickers();
-  $("nights").value = String(params.nights || 1);
+  const initialRanges = params.ranges?.length
+    ? params.ranges
+    : [{ from: start, to: end }];
+  setDateRanges(initialRanges);
   $("maxRate").value = params.maxRate;
-  $("minRooms").value = String(params.minRooms || 1);
+  $("minRooms").value = String(parseMinRooms(params.minRooms, 1));
   $("rateType").value = "fnf";
   updateRateTypeUi();
   state.dowSelected = new Set();
+  state.focusCtyhocn = params.ctyhocn || null;
+  state.focusHotelName = params.hotel || null;
+
+  // Deep-link from map: open Cached search for one hotel (all dates / lengths).
+  if (params.ctyhocn) {
+    $("destination").value = "Cached";
+    state.selectedSuggestion = { ...CACHED_SUGGESTION };
+    setDateRanges([]);
+  }
+
   writeParams(formValues());
 
+  await loadPersistedRoomDetails();
   await loadRecentSearches();
 
   $("searchForm").addEventListener("submit", runSearch);
@@ -2684,6 +3131,40 @@ async function boot() {
     stopSearch();
   });
   $("exportBtn").addEventListener("click", exportCsv);
+  $("pageSize")?.addEventListener("change", () => {
+    const next = Number($("pageSize").value) || 25;
+    state.pageSize = [25, 50, 75, 100].includes(next) ? next : 25;
+    state.page = 0;
+    refreshTable();
+  });
+  $("pagePrev")?.addEventListener("click", () => {
+    if (state.page <= 0) return;
+    state.page -= 1;
+    refreshTable();
+  });
+  $("pageNext")?.addEventListener("click", () => {
+    const totalPages = totalPagesFor(state.rows.length);
+    if (state.page >= totalPages - 1) return;
+    state.page += 1;
+    refreshTable();
+  });
+  $("pageJump")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      jumpToResultsPage($("pageJump").value);
+      $("pageJump").blur();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      updatePagerUi(state.rows.length);
+      $("pageJump").blur();
+    }
+  });
+  $("pageJump")?.addEventListener("change", () => {
+    jumpToResultsPage($("pageJump").value);
+  });
+  $("pageJump")?.addEventListener("focus", () => {
+    $("pageJump").select();
+  });
   $("resultsBody").addEventListener("click", (e) => {
     const cacheRefresh = e.target.closest("[data-cache-refresh]");
     if (cacheRefresh?.dataset.cacheRefresh) {
@@ -2752,6 +3233,10 @@ async function boot() {
   setupReauthHandling();
   setupMetricsSession();
   refreshSession();
+
+  if (params.ctyhocn) {
+    queueMicrotask(() => runSearch());
+  }
 }
 
 boot();
