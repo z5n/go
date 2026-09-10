@@ -1281,13 +1281,16 @@ async function refreshCachedEntry(key) {
   if (updated) {
     const detailKey = roomDetailKey(updated);
     if (!res.roomsError) {
+      const rooms = res.rooms || [];
       state.roomDetails.set(detailKey, {
         status: "ok",
-        rooms: res.rooms || [],
+        rooms,
         fromCache: false,
         currency: res.currency || null,
         savedAt: Date.now(),
       });
+      // ShopAvail is authoritative — don't keep a calendar-only teaser price.
+      syncRowsToShopRooms(detailKey, rooms, res.currency || null);
       schedulePersistRoomDetails();
     } else {
       state.roomDetails.delete(detailKey);
@@ -1552,12 +1555,90 @@ function roomsSectionHtml(key, row) {
   </div>`;
 }
 
+function cheapestShopRoom(rooms) {
+  let best = null;
+  for (const room of rooms || []) {
+    if (room == null || room.amount == null) continue;
+    const amount = Number(room.amount);
+    if (!Number.isFinite(amount)) continue;
+    if (!best || amount < Number(best.amount)) best = room;
+  }
+  return best;
+}
+
+/** Prefer bookable shopAvail prices over calendar lead rates for a stay. */
+function patchRowFromShopRoom(row, best, currency = null) {
+  if (!row || !best || best.amount == null) return row;
+  const amount = Number(best.amount);
+  if (!Number.isFinite(amount)) return row;
+  const nextCurrency = currency || best.currency || row.currency || "USD";
+  const same =
+    row.shopPriced &&
+    Number(row.amount) === amount &&
+    String(row.ratePlanCode || "") === String(best.ratePlanCode || "") &&
+    String(row.roomTypeCode || "") === String(best.roomTypeCode || "") &&
+    String(row.specialRateType || "") === String(best.specialRateType || "");
+  if (same) return row;
+  return {
+    ...row,
+    amount,
+    amountFmt: best.amountFmt || `$${Math.round(amount)}`,
+    currency: nextCurrency,
+    roomsAvail: best.roomsAvail ?? row.roomsAvail,
+    ratePlanCode: best.ratePlanCode || null,
+    ratePlanName: best.ratePlanName || null,
+    ratePlanDesc: best.ratePlanDesc || null,
+    roomTypeCode: best.roomTypeCode || null,
+    specialRateType: best.specialRateType || null,
+    isGoRate: Boolean(best.isGoRate),
+    shopPriced: true,
+  };
+}
+
+function syncRowsToShopRooms(detailKey, rooms, currency = null) {
+  const best = cheapestShopRoom(rooms);
+  if (!best || !detailKey) return 0;
+  let changed = 0;
+  const nextRows = [];
+  for (const existing of state.allRows) {
+    if (roomDetailKey(existing) !== detailKey) {
+      nextRows.push(existing);
+      continue;
+    }
+    const oldKey = rowKey(existing);
+    const patched = patchRowFromShopRoom(existing, best, currency);
+    if (patched === existing) {
+      nextRows.push(existing);
+      continue;
+    }
+    migrateRowKeyState(oldKey, rowKey(patched));
+    nextRows.push(patched);
+    changed += 1;
+  }
+  if (changed) state.allRows = nextRows;
+  return changed;
+}
+
+function reconcileShopPricesIntoRows() {
+  let changed = 0;
+  for (const [key, detail] of state.roomDetails) {
+    if (detail?.status !== "ok" || !detail.rooms?.length) continue;
+    changed += syncRowsToShopRooms(key, detail.rooms, detail.currency);
+  }
+  return changed;
+}
+
 async function loadRoomRates(detailKey, row) {
   if (!row?.ctyhocn || !detailKey) return;
   const stay = stayDatesForRoomFetch(row);
   if (!stay) return;
   const existing = state.roomDetails.get(detailKey);
-  if (existing?.status === "loading" || existing?.status === "ok") return;
+  if (existing?.status === "loading") return;
+  if (existing?.status === "ok") {
+    // Already have shop rooms — keep the entry price aligned with bookable rates.
+    if (syncRowsToShopRooms(detailKey, existing.rooms, existing.currency)) refreshTable();
+    return;
+  }
 
   state.roomDetails.set(detailKey, {
     status: "loading",
@@ -1596,13 +1677,16 @@ async function loadRoomRates(detailKey, row) {
     return;
   }
 
+  const rooms = res.rooms || [];
   state.roomDetails.set(detailKey, {
     status: "ok",
-    rooms: res.rooms || [],
+    rooms,
     fromCache: Boolean(res.fromCache),
     currency: res.currency || null,
     savedAt: Date.now(),
   });
+  // Calendar lead rates can advertise F&F prices that aren't bookable on shopAvail.
+  syncRowsToShopRooms(detailKey, rooms, res.currency || null);
   schedulePersistRoomDetails();
   refreshTable();
 }
@@ -1681,12 +1765,14 @@ async function hydrateFnfComparesFromCache(rows) {
   if (values.rateType === "tm") return;
   const friendsAndFamily = true;
   const token = ++hydrateFnfToken;
+  let applied = reconcileShopPricesIntoRows();
   const stays = [];
   const seen = new Set();
   for (const row of rows || []) {
     if (!row?.ctyhocn || row.error) continue;
     if (row.inventoryOnly && !row.stayPriced) continue;
-    if (!isFamilyAndFriendsRate(row)) continue;
+    // Pull shop cache for advertised F&F leads (to correct teaser prices) and already shop-priced stays.
+    if (!isFamilyAndFriendsRate(row) && !row.shopPriced) continue;
     const detailKey = roomDetailKey(row, friendsAndFamily);
     if (seen.has(detailKey)) continue;
     seen.add(detailKey);
@@ -1702,9 +1788,11 @@ async function hydrateFnfComparesFromCache(rows) {
       friendsAndFamily,
     });
   }
-  if (!stays.length) return;
+  if (!stays.length) {
+    if (applied > 0 && token === hydrateFnfToken) refreshTable();
+    return;
+  }
 
-  let applied = 0;
   for (let i = 0; i < stays.length; i += ROOM_CACHE_LOOKUP_BATCH) {
     if (token !== hydrateFnfToken || state.scanning) return;
     const chunk = stays.slice(i, i + ROOM_CACHE_LOOKUP_BATCH);
@@ -1723,15 +1811,19 @@ async function hydrateFnfComparesFromCache(rows) {
       if (!hit?.rooms?.length) continue;
       const { key } = chunk[j];
       const existing = state.roomDetails.get(key);
-      if (existing?.status === "ok" && existing.rooms?.length) continue;
-      state.roomDetails.set(key, {
-        status: "ok",
-        rooms: hit.rooms,
-        fromCache: true,
-        currency: hit.currency || null,
-        savedAt: Date.now(),
-      });
-      applied += 1;
+      let did = false;
+      if (!(existing?.status === "ok" && existing.rooms?.length)) {
+        state.roomDetails.set(key, {
+          status: "ok",
+          rooms: hit.rooms,
+          fromCache: true,
+          currency: hit.currency || null,
+          savedAt: Date.now(),
+        });
+        did = true;
+      }
+      if (syncRowsToShopRooms(key, hit.rooms, hit.currency || null)) did = true;
+      if (did) applied += 1;
     }
   }
   if (applied > 0 && token === hydrateFnfToken) {
@@ -1757,11 +1849,12 @@ function enqueueRoomRateFetch(row, { priority = false } = {}) {
   if (!row?.ctyhocn) return;
   const detailKey = roomDetailKey(row);
   const existing = state.roomDetails.get(detailKey);
-  if (
-    existing?.status === "ok" ||
-    existing?.status === "loading" ||
-    existing?.status === "queued"
-  ) {
+  if (existing?.status === "ok") {
+    // Already shopped — still align the entry price with bookable rates.
+    syncRowsToShopRooms(detailKey, existing.rooms, existing.currency);
+    return;
+  }
+  if (existing?.status === "loading" || existing?.status === "queued") {
     return;
   }
   state.roomDetails.set(detailKey, {
@@ -1994,7 +2087,9 @@ function toggleExpanded(key) {
   if (row) {
     const detail = state.roomDetails.get(roomDetailKey(row));
     // Already have rooms — keep them (and F&F compare) without reloading.
-    if (!(detail?.status === "ok" && detail.rooms?.length)) {
+    if (detail?.status === "ok" && detail.rooms?.length) {
+      syncRowsToShopRooms(roomDetailKey(row), detail.rooms, detail.currency);
+    } else {
       enqueueRoomRateFetch(row, { priority: true });
     }
   }
@@ -2025,6 +2120,51 @@ function formatScanErrorStatus(errors) {
   return groups
     .map((g) => `${g.count} failed: ${String(g.msg || "").replace(/\.+$/, "")}`)
     .join(" · ");
+}
+
+function scanErrorsTooltipText(errors) {
+  const groups = summarizeScanErrors(errors);
+  if (!groups.length) return "";
+  return groups
+    .map((g) => `${g.count}× ${g.msg}${g.sample ? `\n${g.sample}` : ""}`)
+    .join("\n\n");
+}
+
+function scanErrorsTooltipHtml(errors) {
+  const groups = summarizeScanErrors(errors);
+  if (!groups.length) return "";
+  return groups
+    .map(
+      (g) =>
+        `<div class="results-failed-group">
+          <div class="results-failed-msg"><strong>${formatCount(g.count)}×</strong> ${escapeHtml(g.msg)}</div>
+          ${g.sample ? `<div class="results-failed-hotels">${escapeHtml(g.sample)}</div>` : ""}
+        </div>`
+    )
+    .join("");
+}
+
+function resultsFailedBitHtml(errors) {
+  const list = Array.isArray(errors) ? errors : [];
+  if (!list.length) return "";
+  const tipText = scanErrorsTooltipText(list);
+  return ` · <span class="results-failed" tabindex="0" aria-label="${escapeHtml(
+    `${formatCount(list.length)} failed. ${tipText}`
+  )}"><span class="results-failed-label">${formatCount(
+    list.length
+  )} failed</span><span class="results-failed-tip" role="tooltip">${scanErrorsTooltipHtml(
+    list
+  )}</span></span>`;
+}
+
+function setResultsLabel(baseLabel, { failedCount = 0 } = {}) {
+  const el = $("resultsLabel");
+  if (!el) return;
+  if (failedCount > 0) {
+    el.innerHTML = `${escapeHtml(baseLabel)}${resultsFailedBitHtml(state.scanErrors)}`;
+  } else {
+    el.textContent = baseLabel;
+  }
 }
 
 function scanErrorsHtml(errors) {
@@ -2158,6 +2298,15 @@ function jumpToResultsPage(rawValue) {
 }
 
 function refreshTable() {
+  // ShopAvail is authoritative once rooms are known — don't leave calendar teaser prices.
+  if (!state._reconcilingShop) {
+    state._reconcilingShop = true;
+    try {
+      reconcileShopPricesIntoRows();
+    } finally {
+      state._reconcilingShop = false;
+    }
+  }
   updateColumnFilterUi();
   const filtered = filterResultRows(state.allRows);
   state.rows = sortedRows(filtered);
@@ -2187,9 +2336,7 @@ function refreshTable() {
           filtersActive: true,
         })
       : "0 stays • 0 hotels matching";
-    $("resultsLabel").textContent = state.scanErrors.length
-      ? `${emptyLabel} · ${formatCount(state.scanErrors.length)} failed`
-      : emptyLabel;
+    setResultsLabel(emptyLabel, { failedCount: state.scanErrors.length });
     updatePagerUi(0);
     return;
   }
@@ -2198,9 +2345,7 @@ function refreshTable() {
     totalRows: state.allRows.length,
     filtersActive,
   });
-  $("resultsLabel").textContent = state.scanErrors.length
-    ? `${label} · ${formatCount(state.scanErrors.length)} failed`
-    : label;
+  setResultsLabel(label, { failedCount: state.scanErrors.length });
 
   const visible = pageRows(state.rows);
   updatePagerUi(state.rows.length);
