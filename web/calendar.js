@@ -67,9 +67,31 @@ function formatDisplayDate(iso) {
   });
 }
 
-function formatRangeLabel(from, to, { compact = false } = {}) {
+function formatRangeLabel(from, to, { compact = false, mode = null, nights: nightsOpt = null } = {}) {
+  if (from && typeof from === "object") {
+    const range = from;
+    return formatRangeLabel(range.from, range.to, {
+      compact: to?.compact ?? compact,
+      mode: range.mode || null,
+      nights: range.nights ?? null,
+    });
+  }
   if (!from && !to) return "";
-  const nights = nightsBetween(from, to || from);
+  if (mode === "window") {
+    const n = Math.max(1, Math.min(7, Number(nightsOpt) || 1));
+    const stayBit = n === 1 ? "any 1-night" : `any ${n}-night`;
+    if (from && to && from === to) {
+      return compact
+        ? `${formatDisplayDate(from)} · ${stayBit}`
+        : `${formatDisplayDate(from)} arrivals · ${stayBit}`;
+    }
+    if (from && to) {
+      const span = `${formatDisplayDate(from)} → ${formatDisplayDate(to)}`;
+      return compact ? `${span} · ${stayBit}` : `${span} arrivals · ${stayBit}`;
+    }
+    return stayBit;
+  }
+  const nights = nightsOpt != null ? Number(nightsOpt) || 1 : nightsBetween(from, to || from);
   const stayBit = nights === 1 ? "1 night" : `${nights} nights`;
   if (from && to && from === to) {
     return compact ? formatDisplayDate(from) : `${formatDisplayDate(from)} · ${stayBit}`;
@@ -91,7 +113,7 @@ function nightsBetween(from, to) {
   return Math.max(1, days);
 }
 
-function normalizeRange(from, to) {
+function normalizeRange(from, to, { mode = "exact", nights = null } = {}) {
   if (!from) return null;
   let start = from;
   let end = to || from;
@@ -100,14 +122,18 @@ function normalizeRange(from, to) {
     start = end;
     end = tmp;
   }
-  // Same-day pick = 1-night stay (check-out next day).
+  if (mode === "window") {
+    const n = Math.max(1, Math.min(7, Number(nights) || 1));
+    return { from: start, to: end, nights: n, mode: "window" };
+  }
+  // Exact stay: same-day pick = 1-night stay (check-out next day).
   if (end === start) {
     const d = parseISODate(start);
     if (!d) return null;
     d.setDate(d.getDate() + 1);
     end = toISODate(d);
   }
-  return { from: start, to: end };
+  return { from: start, to: end, nights: nightsBetween(start, end), mode: "exact" };
 }
 
 function isoInRange(iso, from, to) {
@@ -131,8 +157,10 @@ function yearOptions(centerYear) {
  *   to?: string | null,
  *   existingRanges?: Array<{ from: string, to: string }>,
  *   month?: Date,
+ *   mode?: "exact" | "window",
+ *   nights?: number,
  *   onChange?: (draft: { from: string | null, to: string | null }) => void,
- *   onComplete?: (range: { from: string, to: string }) => void,
+ *   onComplete?: (range: { from: string, to: string, nights?: number, mode?: string }) => void,
  *   showOutsideDays?: boolean,
  * }} options
  */
@@ -149,6 +177,8 @@ function createRangeCalendar(root, options = {}) {
     ),
     existingRanges: Array.isArray(options.existingRanges) ? options.existingRanges : [],
     showOutsideDays: options.showOutsideDays !== false,
+    mode: options.mode === "window" ? "window" : "exact",
+    nights: Math.max(1, Math.min(7, Number(options.nights) || 1)),
   };
 
   root.classList.add("ui-calendar");
@@ -164,17 +194,30 @@ function createRangeCalendar(root, options = {}) {
     options.onChange?.({ from: state.from, to: state.to });
   }
 
+  function draftRange() {
+    const end = previewEnd();
+    if (!state.from || !end) return null;
+    return normalizeRange(state.from, end, {
+      mode: state.mode,
+      nights: state.nights,
+    });
+  }
+
   function render() {
     const month = state.month;
     const year = month.getFullYear();
     const monthIndex = month.getMonth();
     const today = new Date();
     const draftEnd = previewEnd();
-    const draft = normalizeRange(state.from, draftEnd);
+    const draft = draftRange();
     const hint =
-      state.from && !state.to
-        ? "Select check-out"
-        : "Select check-in";
+      state.mode === "window"
+        ? state.from && !state.to
+          ? "Select last arrival date"
+          : "Select first arrival date"
+        : state.from && !state.to
+          ? "Select check-out"
+          : "Select check-in";
 
     const firstDow = new Date(year, monthIndex, 1).getDay();
     const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
@@ -206,9 +249,11 @@ function createRangeCalendar(root, options = {}) {
       const isEnd = draftEnd && iso === draftEnd && Boolean(state.from);
       const inDraft =
         draft && isoInRange(iso, draft.from, draft.to) && !isStart && !isEnd;
-      const inExisting = state.existingRanges.some(
-        (r) => isoInRange(iso, r.from, r.to)
-      );
+      const inExisting = state.existingRanges.some((r) => {
+        if (r.mode === "window") return isoInRange(iso, r.from, r.to);
+        // Exact stays highlight arrival→departure span.
+        return isoInRange(iso, r.from, r.to);
+      });
       const isToday = sameDay(cellDate, today);
       const classes = [
         "ui-calendar-day",
@@ -296,7 +341,11 @@ function createRangeCalendar(root, options = {}) {
         render();
         return;
       }
-      const range = normalizeRange(state.from, iso);
+      const range = normalizeRange(state.from, iso, {
+        mode: state.mode,
+        nights: state.nights,
+      });
+      if (!range) return;
       state.from = range.from;
       state.to = range.to;
       state.hover = null;
@@ -341,6 +390,20 @@ function createRangeCalendar(root, options = {}) {
       state.existingRanges = Array.isArray(ranges) ? ranges : [];
       render();
     },
+    setMode(mode) {
+      state.mode = mode === "window" ? "window" : "exact";
+      render();
+    },
+    setNights(nights) {
+      state.nights = Math.max(1, Math.min(7, Number(nights) || 1));
+      render();
+    },
+    getMode() {
+      return state.mode;
+    },
+    getNights() {
+      return state.nights;
+    },
     resetDraft() {
       state.from = null;
       state.to = null;
@@ -366,12 +429,42 @@ function ensureRangesPanel() {
   sharedPanel.className = "date-picker-panel date-ranges-panel";
   sharedPanel.hidden = true;
   sharedPanel.setAttribute("role", "dialog");
-  sharedPanel.setAttribute("aria-label", "Choose date ranges");
+  sharedPanel.setAttribute("aria-label", "Choose stays");
+  sharedPanel.innerHTML = `
+    <div class="date-ranges-mode" role="tablist" aria-label="Stay type">
+      <button type="button" class="date-ranges-mode-btn is-active" data-stay-mode="exact" role="tab" aria-selected="true">
+        Exact stay
+      </button>
+      <button type="button" class="date-ranges-mode-btn" data-stay-mode="window" role="tab" aria-selected="false">
+        Wide range
+      </button>
+    </div>
+    <div class="date-ranges-window-opts" hidden>
+      <label class="date-ranges-nights">
+        <span>Nights</span>
+        <input type="number" min="1" max="7" value="1" inputmode="numeric" aria-label="Length of stay in nights" />
+      </label>
+      <span class="date-ranges-window-help">Search every arrival in the selected dates</span>
+    </div>
+  `;
   sharedCalendar = document.createElement("div");
   sharedPanel.appendChild(sharedCalendar);
   document.body.appendChild(sharedPanel);
 
-  sharedPanel.addEventListener("click", (e) => e.stopPropagation());
+  sharedPanel.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const modeBtn = e.target.closest("[data-stay-mode]");
+    if (!modeBtn) return;
+    const mode = modeBtn.dataset.stayMode === "window" ? "window" : "exact";
+    setStayPanelMode(mode);
+  });
+  sharedPanel.addEventListener("change", (e) => {
+    const nightsInput = e.target.closest(".date-ranges-nights input");
+    if (!nightsInput) return;
+    const n = Math.max(1, Math.min(7, Number(nightsInput.value) || 1));
+    nightsInput.value = String(n);
+    sharedCalendarApi?.setNights?.(n);
+  });
 
   document.addEventListener("click", () => closeRangesPanel());
   document.addEventListener("keydown", (e) => {
@@ -382,6 +475,27 @@ function ensureRangesPanel() {
   });
 
   return sharedPanel;
+}
+
+function setStayPanelMode(mode) {
+  const panel = ensureRangesPanel();
+  const next = mode === "window" ? "window" : "exact";
+  panel.querySelectorAll("[data-stay-mode]").forEach((btn) => {
+    const active = btn.dataset.stayMode === next;
+    btn.classList.toggle("is-active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  const opts = panel.querySelector(".date-ranges-window-opts");
+  if (opts) opts.hidden = next !== "window";
+  sharedCalendarApi?.setMode?.(next);
+  if (next === "window") {
+    const nightsInput = panel.querySelector(".date-ranges-nights input");
+    const n = Math.max(1, Math.min(7, Number(nightsInput?.value) || 1));
+    if (nightsInput) nightsInput.value = String(n);
+    sharedCalendarApi?.setNights?.(n);
+  }
+  sharedCalendarApi?.resetDraft?.();
+  positionRangesPanel();
 }
 
 function positionRangesPanel() {
@@ -424,7 +538,9 @@ function openRangesPanel() {
     });
   }
   sharedCalendarApi.setExistingRanges(rangesFieldApi.getRanges());
-  sharedCalendarApi.resetDraft();
+  const activeMode =
+    sharedPanel.querySelector("[data-stay-mode].is-active")?.dataset.stayMode || "exact";
+  setStayPanelMode(activeMode === "window" ? "window" : "exact");
   sharedPanel.hidden = false;
   panelOpen = true;
   rangesFieldApi.trigger.setAttribute("aria-expanded", "true");
@@ -471,7 +587,12 @@ function setupDateRangesField(rootId, options = {}) {
   let ranges = [];
 
   function rangesEqual(a, b) {
-    return a.from === b.from && a.to === b.to;
+    return (
+      a.from === b.from &&
+      a.to === b.to &&
+      (a.mode || "exact") === (b.mode || "exact") &&
+      Number(a.nights || 0) === Number(b.nights || 0)
+    );
   }
 
   function sync() {
@@ -488,8 +609,8 @@ function setupDateRangesField(rootId, options = {}) {
     chipsEl.innerHTML = ranges
       .map(
         (r, i) =>
-          `<span class="date-range-chip" data-range-index="${i}">
-            <span class="date-range-chip-label">${escapeAttr(formatRangeLabel(r.from, r.to, { compact: true }))}</span>
+          `<span class="date-range-chip${r.mode === "window" ? " is-window" : ""}" data-range-index="${i}">
+            <span class="date-range-chip-label">${escapeAttr(formatRangeLabel(r, null, { compact: true }))}</span>
             <button type="button" class="date-range-chip-remove" data-remove-range="${i}" aria-label="Remove range">×</button>
           </span>`
       )
@@ -508,14 +629,22 @@ function setupDateRangesField(rootId, options = {}) {
     },
     setRanges(next) {
       ranges = (Array.isArray(next) ? next : [])
-        .map((r) => normalizeRange(r.from || r.fromDate, r.to || r.toDate))
+        .map((r) =>
+          normalizeRange(r.from || r.fromDate, r.to || r.toDate, {
+            mode: r.mode === "window" ? "window" : "exact",
+            nights: r.nights,
+          })
+        )
         .filter(Boolean);
       sync();
       emit();
       if (panelOpen) sharedCalendarApi?.setExistingRanges(api.getRanges());
     },
     addRange(range) {
-      const normalized = normalizeRange(range.from, range.to);
+      const normalized = normalizeRange(range.from, range.to, {
+        mode: range.mode === "window" ? "window" : "exact",
+        nights: range.nights,
+      });
       if (!normalized) return;
       if (ranges.some((r) => rangesEqual(r, normalized))) return;
       ranges = [...ranges, normalized].sort((a, b) =>

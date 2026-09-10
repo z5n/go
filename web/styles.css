@@ -2005,6 +2005,86 @@ a {
   background: rgba(255, 255, 255, 0.08);
 }
 
+.date-range-chip.is-window {
+  border-color: rgba(61, 214, 198, 0.45);
+  background: rgba(61, 214, 198, 0.1);
+}
+
+.date-ranges-mode {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.date-ranges-mode-btn {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.date-ranges-mode-btn:hover {
+  color: var(--text);
+  border-color: rgba(91, 140, 255, 0.35);
+}
+
+.date-ranges-mode-btn.is-active {
+  color: var(--text);
+  background: rgba(91, 140, 255, 0.14);
+  border-color: rgba(91, 140, 255, 0.45);
+}
+
+.date-ranges-window-opts {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.date-ranges-window-opts[hidden] {
+  display: none !important;
+}
+
+.date-ranges-nights {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.date-ranges-nights input {
+  width: 3.25rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #121a2b;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  padding: 5px 8px;
+  color-scheme: dark;
+}
+
+.date-ranges-window-help {
+  font-size: 11px;
+  color: var(--muted);
+  flex: 1;
+  min-width: 12ch;
+}
+
+.date-ranges-panel {
+  padding: 12px;
+}
+
 .date-ranges-icon {
   flex: 0 0 auto;
   color: var(--muted);

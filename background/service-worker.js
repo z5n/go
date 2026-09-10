@@ -184,6 +184,23 @@ function nightsBetweenISO(fromDate, toDate) {
   return Math.max(1, Math.round((to.getTime() - from.getTime()) / 86400000));
 }
 
+function monthsCovered(fromISO, toISO) {
+  const start = dateOnly(fromISO);
+  const end = dateOnly(toISO) || start;
+  if (!start) return [];
+  const out = [];
+  let cur = `${start.slice(0, 7)}-01`;
+  const last = `${(end || start).slice(0, 7)}-01`;
+  while (cur <= last) {
+    out.push(cur);
+    const [y, m] = cur.split("-").map(Number);
+    const next = m === 12 ? `${y + 1}-01-01` : `${y}-${String(m + 1).padStart(2, "0")}-01`;
+    cur = next;
+    if (out.length > 36) break;
+  }
+  return out;
+}
+
 function normalizeScanRanges(message = {}) {
   const raw = Array.isArray(message.ranges)
     ? message.ranges
@@ -195,6 +212,22 @@ function normalizeScanRanges(message = {}) {
       let from = dateOnly(r?.from || r?.fromDate || "");
       let to = dateOnly(r?.to || r?.toDate || "");
       if (!from) return null;
+      const mode = r?.mode === "window" ? "window" : "exact";
+      if (mode === "window") {
+        if (!to) to = from;
+        if (to < from) {
+          const tmp = from;
+          from = to;
+          to = tmp;
+        }
+        const nights = Math.max(1, Math.min(7, Number(r?.nights) || 1));
+        return {
+          fromDate: from,
+          toDate: to,
+          nights,
+          mode: "window",
+        };
+      }
       if (!to) to = addDaysISO(from, 1);
       if (to < from) {
         const tmp = from;
@@ -205,8 +238,8 @@ function normalizeScanRanges(message = {}) {
       return {
         fromDate: from,
         toDate: to,
-        // Always derive from dates — never trust a stale nights field.
         nights: nightsBetweenISO(from, to),
+        mode: "exact",
       };
     })
     .filter(Boolean);
@@ -220,7 +253,7 @@ function normalizeScanRanges(message = {}) {
       to = tmp;
     }
     if (to === from) to = addDaysISO(from, 1);
-    return [{ fromDate: from, toDate: to, nights: nightsBetweenISO(from, to) }];
+    return [{ fromDate: from, toDate: to, nights: nightsBetweenISO(from, to), mode: "exact" }];
   }
   return [];
 }
@@ -366,13 +399,18 @@ function buildCachedScanRows(entries, {
       if ((day.roomsAvail ?? 0) < minRooms) continue;
       if (scanRanges.length) {
         const arrivalDay = String(arrival).slice(0, 10);
-        const match = scanRanges.find(
-          (r) =>
-            String(r.fromDate).slice(0, 10) === arrivalDay &&
-            Number(r.nights) === entryNights
-        );
+        const match = scanRanges.find((r) => {
+          if (Number(r.nights) !== entryNights) return false;
+          if (r.mode === "window") {
+            const start = String(r.fromDate).slice(0, 10);
+            const end = String(r.toDate).slice(0, 10);
+            return arrivalDay >= start && arrivalDay <= end;
+          }
+          return String(r.fromDate).slice(0, 10) === arrivalDay;
+        });
         if (!match) continue;
-        const departureDate = match.toDate;
+        const departureDate =
+          match.mode === "window" ? addDaysISO(arrivalDay, entryNights) : match.toDate;
         if (hotelCtyhocn) matchedHotels.add(hotelCtyhocn);
         rows.push({
           arrivalDate: arrivalDay,
@@ -395,7 +433,7 @@ function buildCachedScanRows(entries, {
           city: meta.city || entry.city || null,
           country: meta.country || entry.country || null,
           ctyhocn: hotelCtyhocn,
-          nights: match.nights,
+          nights: entryNights,
           fromCache: true,
           fetchedAt: entry.fetchedAt || null,
           bookUrl: `https://www.hilton.com/en/book/reservation/rooms/?ctyhocn=${encodeURIComponent(
@@ -1047,21 +1085,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       const tooLong = scanRanges.find((r) => r.nights > 7);
       if (tooLong) {
-        const err = `Stays can be at most 7 nights (got ${tooLong.nights} for ${tooLong.fromDate} → ${tooLong.toDate}).`;
+        const err =
+          tooLong.mode === "window"
+            ? `Wide-range stays can be at most 7 nights (got ${tooLong.nights}).`
+            : `Stays can be at most 7 nights (got ${tooLong.nights} for ${tooLong.fromDate} → ${tooLong.toDate}).`;
         recordActivity({ type: "scan", name: "rates_error", ok: false, error: err });
         sendResponse({ ok: false, error: err });
         return;
       }
 
-      // One calendar fetch per hotel × stay (month + length of stay).
+      // Exact stay: one calendar fetch per hotel × stay month.
+      // Wide range: one fetch per hotel × calendar month covered by the arrival window × nights.
       const jobs = [];
       for (const hotel of hotels || []) {
         for (const stay of scanRanges) {
-          jobs.push({
-            hotel,
-            stay,
-            monthArrival: `${String(stay.fromDate).slice(0, 7)}-01`,
-          });
+          if (stay.mode === "window") {
+            for (const monthArrival of monthsCovered(stay.fromDate, stay.toDate)) {
+              jobs.push({ hotel, stay, monthArrival });
+            }
+          } else {
+            jobs.push({
+              hotel,
+              stay,
+              monthArrival: `${String(stay.fromDate).slice(0, 7)}-01`,
+            });
+          }
         }
       }
       const rows = [];
@@ -1130,12 +1178,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           for (const day of calendar.days || []) {
             if (day.amount == null) continue;
             const arrival = dateOnly(day.arrivalDate);
-            // Exact stay: check-in must match this range's start.
-            if (arrival !== checkIn) continue;
+            if (!arrival) continue;
+            let departureDate;
+            if (stay.mode === "window") {
+              if (arrival < checkIn || arrival > checkOut) continue;
+              departureDate = addDaysISO(arrival, nights);
+            } else {
+              // Exact stay: check-in must match this range's start.
+              if (arrival !== checkIn) continue;
+              departureDate = checkOut;
+            }
             if (goOnly && !day.isGoRate) continue;
             if (maxRate != null && day.amount > maxRate) continue;
             if ((day.roomsAvail ?? 0) < minRooms) continue;
-            const departureDate = checkOut;
             const ctyhocn = calendar.ctyhocn || hotel.ctyhocn;
             rows.push({
               arrivalDate: arrival,

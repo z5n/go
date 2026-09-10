@@ -97,16 +97,31 @@ function parseRangesParam(raw) {
   return String(raw)
     .split(",")
     .map((part) => {
-      const [from, to] = part.split("_");
+      const bits = part.split("_");
+      if (bits.length < 2) return null;
+      const from = bits[0];
+      const to = bits[1];
       if (!from || !to) return null;
-      return { from, to };
+      // Wide range: from_to_wN  (arrival window + nights)
+      if (bits.length >= 3 && /^w\d+$/i.test(bits[2])) {
+        const nights = Math.max(1, Math.min(7, Number(bits[2].slice(1)) || 1));
+        return { from, to, nights, mode: "window" };
+      }
+      return { from, to, mode: "exact" };
     })
     .filter(Boolean);
 }
 
 function encodeRangesParam(ranges) {
   return (ranges || [])
-    .map((r) => `${r.from}_${r.to}`)
+    .map((r) => {
+      if (!r?.from || !r?.to) return "";
+      if (r.mode === "window") {
+        const n = Math.max(1, Math.min(7, Number(r.nights) || 1));
+        return `${r.from}_${r.to}_w${n}`;
+      }
+      return `${r.from}_${r.to}`;
+    })
     .filter(Boolean)
     .join(",");
 }
@@ -114,7 +129,16 @@ function encodeRangesParam(ranges) {
 function formatRangesSummary(ranges) {
   const list = Array.isArray(ranges) ? ranges : [];
   if (!list.length) return "any stays";
-  if (list.length === 1) return formatRangeLabel(list[0].from, list[0].to);
+  if (list.length === 1) return formatRangeLabel(list[0]);
+  const windows = list.filter((r) => r.mode === "window");
+  if (windows.length === list.length) {
+    const nights = [...new Set(list.map((r) => Number(r.nights) || 1))];
+    if (nights.length === 1) {
+      const n = nights[0];
+      return `${list.length} × any ${n === 1 ? "1-night" : `${n}-night`} windows`;
+    }
+    return `${list.length} wide-range stays`;
+  }
   const nights = [...new Set(list.map((r) => Number(r.nights) || nightsBetween(r.from, r.to)))];
   if (nights.length === 1) {
     const n = nights[0];
@@ -129,7 +153,15 @@ function enrichRanges(ranges) {
       const from = r.from || r.fromDate;
       const to = r.to || r.toDate;
       if (!from || !to) return null;
-      return { from, to, nights: nightsBetween(from, to) };
+      if (r.mode === "window") {
+        return {
+          from,
+          to,
+          nights: Math.max(1, Math.min(7, Number(r.nights) || 1)),
+          mode: "window",
+        };
+      }
+      return { from, to, nights: nightsBetween(from, to), mode: "exact" };
     })
     .filter(Boolean);
 }
@@ -2369,7 +2401,11 @@ async function persistRecentSearches(list) {
 function searchFingerprint(entry) {
   const sug = entry.selectedSuggestion;
   const rangesKey = (entry.ranges || [])
-    .map((r) => `${r.from}_${r.to}`)
+    .map((r) =>
+      r.mode === "window"
+        ? `${r.from}_${r.to}_w${Number(r.nights) || 1}`
+        : `${r.from}_${r.to}`
+    )
     .join(",");
   return [
     entry.destination || "",
@@ -2781,9 +2817,13 @@ async function runSearch(event) {
     setStatus("Destination and at least one stay are required.");
     return;
   }
-  const tooLong = values.ranges?.find((r) => r.nights > 7);
+  const tooLong = values.ranges?.find((r) => Number(r.nights) > 7);
   if (tooLong) {
-    setStatus(`Stays can be at most 7 nights (${formatRangeLabel(tooLong.from, tooLong.to)}).`);
+    setStatus(
+      tooLong.mode === "window"
+        ? `Wide-range stays can be at most 7 nights (got ${tooLong.nights}).`
+        : `Stays can be at most 7 nights (${formatRangeLabel(tooLong)}).`
+    );
     return;
   }
 
@@ -2877,6 +2917,7 @@ async function runSearch(event) {
           from: r.from,
           to: r.to,
           nights: r.nights,
+          mode: r.mode || "exact",
         })),
         friendsAndFamily: values.rateType !== "tm",
         goOnly: values.goOnly,
@@ -2996,6 +3037,7 @@ async function runSearch(event) {
         from: r.from,
         to: r.to,
         nights: r.nights,
+        mode: r.mode || "exact",
       })),
       friendsAndFamily: values.rateType !== "tm",
       goOnly: values.goOnly,
