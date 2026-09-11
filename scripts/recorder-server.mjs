@@ -133,10 +133,9 @@ await writeStatus();
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║  Go Hilton recorder server on http://127.0.0.1:${PORT}     ║
+║  Go Hilton recorder server on http://127.0.0.1:${PORT}   ║
 ║                                                          ║
-║  1. chrome://extensions → Load unpacked →                ║
-║     /Users/josh/git/go/recorder-extension                ║
+║  1. chrome://extensions → Load unpacked                  ║
 ║  2. Open Hilton in THAT Chrome profile (already signed   ║
 ║     in is ideal) and use Go Hilton normally              ║
 ║  3. Search Geneva, open a hotel, open flexible dates,    ║
