@@ -9,6 +9,7 @@ import {
   getAuthSession,
   getAccessTokenFingerprint,
   isUnauthorizedError,
+  isTransientHiltonError,
 } from "./hilton-api.js";
 import {
   getCachedCalendar,
@@ -29,6 +30,14 @@ import {
   runWithMetricsSession,
   recordActivity,
 } from "./request-metrics.js";
+import {
+  cachedFlightSearch,
+  fetchTripDetails,
+  hotelStaysFromFlights,
+  readSeatsApiKey,
+  writeSeatsApiKey,
+  TRANSFER_PARTNER_PRESETS,
+} from "./seats-aero.js";
 
 async function clearGuestSession() {
   const fingerprint = await getAccessTokenFingerprint().catch(() => null);
@@ -89,7 +98,7 @@ async function geocodePlaceLabel(city, country) {
   return hit;
 }
 
-/** Hotels for the coverage map; backfill a few missing coords from city/country. */
+/** Hotels for the coverage map (hotel calendar cache only — not flights). */
 async function buildCacheMapHotels() {
   const hotels = await listCachedMapHotels({ includeStale: true });
   const needGeo = hotels.filter(
@@ -157,7 +166,7 @@ chrome.webRequest.onBeforeRequest.addListener(
 );
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.storage.sync.set({ delayMs: 1000 });
+  chrome.storage.sync.set({ delayMs: 1500 });
 });
 
 async function getGuestId() {
@@ -347,6 +356,8 @@ chrome.action.onClicked.addListener(async (tab) => {
 });
 
 let scanCancelled = false;
+/** Bumped on each new SCAN_RATES / destination scan so an older in-flight loop exits. */
+let scanEpoch = 0;
 
 function buildCachedScanRows(entries, {
   ranges = [],
@@ -563,6 +574,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
+      // Lightweight key helpers — keep outside metrics session (same storage
+      // key the search page writes via chrome.storage.local).
+      if (message?.type === "GET_SEATS_API_KEY") {
+        sendResponse({ ok: true, apiKey: await readSeatsApiKey() });
+        return;
+      }
+
+      if (message?.type === "SET_SEATS_API_KEY") {
+        const apiKey = await writeSeatsApiKey(message.apiKey);
+        sendResponse({ ok: true, apiKey });
+        return;
+      }
+
+      if (message?.type === "SEATS_TRANSFER_PRESETS") {
+        sendResponse({
+          ok: true,
+          presets: Object.entries(TRANSFER_PARTNER_PRESETS).map(([id, meta]) => ({
+            id,
+            label: meta.label,
+            sources: meta.sources,
+          })),
+        });
+        return;
+      }
+
     await runWithMetricsSession(sessionId, async () => {
       // Skip logging noisy metrics polling / session bookkeeping chatter.
       if (
@@ -695,6 +731,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       if (message?.type === "STOP_SCAN") {
         scanCancelled = true;
+        scanEpoch += 1;
         recordActivity({ type: "scan", name: "stop_requested" });
         sendResponse({ ok: true, stopped: true });
         return;
@@ -724,6 +761,102 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
         }
         sendResponse({ ok: true, ...result, suggestions });
+        return;
+      }
+
+      if (message?.type === "SEATS_GET_TRIPS") {
+        try {
+          const result = await fetchTripDetails(message.availabilityId);
+          sendResponse({ ok: true, ...result });
+        } catch (err) {
+          sendResponse({
+            ok: false,
+            error: String(err?.message || err),
+            code: err?.code || null,
+          });
+        }
+        return;
+      }
+
+      if (message?.type === "SEATS_CACHED_SEARCH") {
+        recordActivity({
+          type: "search",
+          name: "seats_start",
+          detail: {
+            origins: message.originAirports || null,
+            destinations: message.destinationAirports || null,
+            startDate: message.startDate || null,
+            endDate: message.endDate || null,
+            transferPartners: message.transferPartners || "chase",
+            arrivalDate: message.arrivalDate || message.startDate || null,
+            departureDate: message.departureDate || message.endDate || null,
+          },
+        });
+        try {
+          const result = await cachedFlightSearch({
+            originAirports: message.originAirports,
+            destinationAirports: message.destinationAirports,
+            startDate: message.startDate,
+            endDate: message.endDate,
+            transferPartners: message.transferPartners || "chase",
+            onlyDirect: Boolean(message.onlyDirect),
+            cabins: message.cabins || null,
+            skipCache: Boolean(message.skipCache),
+          });
+          const arrivalDate = message.arrivalDate || null;
+          const departureDate = message.departureDate || null;
+          const stayPlan =
+            arrivalDate && departureDate
+              ? hotelStaysFromFlights(result.flights, {
+                  arrivalDate,
+                  departureDate,
+                })
+              : { stays: [], byDestination: new Map(), nights: 0 };
+          recordActivity({
+            type: "search",
+            name: "seats_done",
+            ok: true,
+            detail: {
+              flightCount: result.count,
+              stayCount: stayPlan.stays.length,
+              destinations: [...stayPlan.byDestination.keys()],
+              transferPartners: result.transferPartners,
+              fromCache: Boolean(result.fromCache),
+              arrivalDate,
+              departureDate,
+              nights: stayPlan.nights,
+            },
+          });
+          sendResponse({
+            ok: true,
+            ...result,
+            arrivalDate,
+            departureDate,
+            nights: stayPlan.nights,
+            stays: stayPlan.stays,
+            destinationsWithFlights: arrivalDate && departureDate
+              ? [...stayPlan.byDestination.keys()]
+              : [
+                  ...new Set(
+                    (result.flights || [])
+                      .map((f) => String(f.destination || "").toUpperCase())
+                      .filter((c) => /^[A-Z]{3}$/.test(c))
+                  ),
+                ],
+          });
+        } catch (err) {
+          recordActivity({
+            type: "search",
+            name: "seats_error",
+            ok: false,
+            error: String(err?.message || err),
+          });
+          sendResponse({
+            ok: false,
+            error: String(err?.message || err),
+            code: err?.code || null,
+          });
+        }
         return;
       }
 
@@ -1057,7 +1190,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message?.type === "SCAN_RATES") {
+      const myEpoch = ++scanEpoch;
       scanCancelled = false;
+      const scanIsStale = () => myEpoch !== scanEpoch || scanCancelled;
       pruneStaleCache().catch(() => {});
       const {
         hotels,
@@ -1068,7 +1203,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         goOnly = true,
         maxRate = null,
         minRooms = 1,
-        delayMs = 1000,
+        delayMs: delayMsRaw = 1000,
       } = message;
 
       const guestId = await getGuestId();
@@ -1115,6 +1250,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const rows = [];
       let done = 0;
       let cacheHits = 0;
+      let delayMs = Math.max(250, Number(delayMsRaw) || 1000);
+      let consecutiveTransientFailures = 0;
       const total = jobs.length;
       const hotelCount = (hotels || []).length;
 
@@ -1134,7 +1271,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
 
       outer: for (const job of jobs) {
-        if (scanCancelled) break outer;
+        if (scanIsStale()) break outer;
         const { hotel, stay, monthArrival } = job;
         const nights = Math.max(1, Number(stay.nights) || nightsBetweenISO(stay.fromDate, stay.toDate));
         const checkIn = dateOnly(stay.fromDate);
@@ -1223,6 +1360,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               )}&room1NumAdults=1`,
             });
           }
+          consecutiveTransientFailures = 0;
         } catch (err) {
           if (isUnauthorizedError(err)) {
             await clearGuestSession();
@@ -1236,7 +1374,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               hotelCount,
               unauthorized: true,
             });
-            scanCancelled = false;
+            if (myEpoch === scanEpoch) scanCancelled = false;
             sendResponse({
               ok: false,
               unauthorized: true,
@@ -1257,6 +1395,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             arrivalDate: stay.fromDate,
             message: String(err.message || err),
           });
+          if (isTransientHiltonError(err)) {
+            consecutiveTransientFailures += 1;
+            // Mild slowdown only — do not sleep for multi-attempt job retries.
+            delayMs = Math.min(4000, Math.max(delayMs, consecutiveTransientFailures >= 3 ? 2500 : 1500));
+          }
         }
         done += 1;
         emitScanProgress({
@@ -1268,12 +1411,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           cacheHits,
           hotelCount,
         });
-        if (scanCancelled) break outer;
+        if (scanIsStale()) break outer;
         if (!fromCache) await new Promise((r) => setTimeout(r, delayMs));
       }
 
-      const cancelled = scanCancelled;
-      scanCancelled = false;
+      const cancelled = scanIsStale();
+      if (myEpoch === scanEpoch) scanCancelled = false;
 
       const unauthorizedRows = rows.filter(
         (r) => r.error && /unauthorized/i.test(String(r.message || ""))

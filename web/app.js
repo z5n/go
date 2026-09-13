@@ -2,9 +2,45 @@ import {
   setupDateRangesField,
   getDateRanges,
   setDateRanges,
+  setDateRangesHints,
+  setDateRangesPlaceholder,
   formatRangeLabel,
   nightsBetween,
 } from "./calendar.js";
+import {
+  setupFlightResultsUi,
+  setFlightResults,
+  clearFlightResults,
+  setTripSelectionListener,
+  getSelectedTripFlights,
+  clearTripFlightSelection,
+  taxAmountDollars,
+  formatPointsWithTaxes,
+  formatMiles as formatAwardMiles,
+  formatProgramName,
+  getFlightResults,
+  ensureTripDetails,
+  prepareFlightForSave,
+  clearSelectedReturnFlight,
+  getTripPairStayConstraint,
+  setSelectedStayConstraint,
+  refreshFlightTable,
+  setBestComboFlightIds,
+  clearBestComboFlightIds,
+  getBestComboFlightIds,
+  setTripFlightSelection,
+} from "./flights.js";
+import {
+  searchAirports,
+  extractIataCode,
+  countryLabel,
+} from "./airports.js";
+import {
+  buildItinerary,
+  itineraryFingerprint,
+  loadSavedItineraries,
+  toggleSavedItinerary,
+} from "./saved-itineraries.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -44,6 +80,7 @@ const state = {
   expanded: new Set(),
   roomDetails: new Map(),
   recentSearches: [],
+  savedItineraries: [],
   roomGroupsOpen: new Set(),
   roomsSectionOpen: new Set(),
   roomDescOpen: new Set(),
@@ -57,6 +94,9 @@ const state = {
   roomFetchPending: [],
   roomFetchInFlight: 0,
   refreshingKeys: new Set(),
+  selectedHotelKey: null,
+  /** Cheapest outbound/return/hotel combo hotel row key (search suggestion). */
+  bestComboHotelKey: null,
   /** Hotels in the active destination scan — used for status “Found N hotels”. */
   scanHotels: [],
   /** Monotonic SCAN_PROGRESS cursor — ignore out-of-order snapshots. */
@@ -69,7 +109,7 @@ const MAX_RECENT_SEARCHES = 8;
 const MAX_ROOM_DETAILS = 80;
 const ROOM_FETCH_CONCURRENCY = 1;
 const ROOM_FETCH_DELAY_MS = 750;
-const SCAN_DELAY_MS = 1000;
+const SCAN_DELAY_MS = 1500;
 const METRICS_SESSION_ID =
   globalThis.crypto?.randomUUID?.() || `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
@@ -186,6 +226,7 @@ function readParams() {
     ranges = [{ from: legacyFrom, to }];
   }
   return {
+    searchMode: params.get("mode") === "flight" ? "flight" : "hotel",
     destination: params.get("destination") || params.get("destinations") || "",
     ranges,
     fromDate: ranges[0]?.from || legacyFrom || "",
@@ -195,11 +236,23 @@ function readParams() {
     rateType: params.get("rate_type") || "fnf",
     ctyhocn: String(params.get("ctyhocn") || "").toUpperCase(),
     hotel: params.get("hotel") || "",
+    flightOrigins: params.get("origins") || "",
+    flightDestinations: params.get("dest_airports") || params.get("airports") || "",
+    flightTripType: params.get("trip") === "oneway" ? "oneway" : "roundtrip",
+    flightRanges: (() => {
+      const fromTrip = parseRangesParam(params.get("trip_dates") || "");
+      if (fromTrip.length) return fromTrip;
+      const start = params.get("depart_from") || params.get("departure") || "";
+      const end = params.get("depart_to") || params.get("return") || "";
+      return start && end ? [{ from: start, to: end, mode: "exact" }] : [];
+    })(),
   };
 }
 
 function writeParams(values) {
   const params = new URLSearchParams();
+  const mode = values.searchMode === "flight" ? "flight" : "hotel";
+  if (mode === "flight") params.set("mode", "flight");
   if (values.destination) params.set("destination", values.destination);
   const ranges = values.ranges?.length
     ? values.ranges
@@ -213,6 +266,16 @@ function writeParams(values) {
   params.set("rate_type", values.rateType);
   if (values.ctyhocn) params.set("ctyhocn", String(values.ctyhocn).toUpperCase());
   if (values.hotel) params.set("hotel", String(values.hotel));
+  if (mode === "flight") {
+    if (values.flightOrigins) params.set("origins", values.flightOrigins);
+    if (values.flightDestinations) params.set("dest_airports", values.flightDestinations);
+    const tripEncoded = encodeRangesParam(values.flightRanges || []);
+    if (tripEncoded) params.set("trip_dates", tripEncoded);
+    // Keep legacy single-date params for the first trip (shareable links / older tools).
+    if (values.flightStartDate) params.set("departure", values.flightStartDate);
+    if (values.flightEndDate) params.set("return", values.flightEndDate);
+    if (values.flightTripType === "oneway") params.set("trip", "oneway");
+  }
   history.replaceState(null, "", `${location.pathname}?${params.toString()}`);
 }
 
@@ -323,7 +386,10 @@ function setupMetricsSession() {
 function formValues() {
   const rateType = $("rateType")?.value === "tm" ? "tm" : "fnf";
   const ranges = enrichRanges(getDateRanges());
+  const flightRanges = enrichRanges(getDateRanges("flightDateRanges"));
+  const searchMode = $("searchMode")?.value === "flight" ? "flight" : "hotel";
   return {
+    searchMode,
     destination: $("destination").value.trim(),
     ranges,
     fromDate: ranges[0]?.from || "",
@@ -335,6 +401,12 @@ function formValues() {
     rateType,
     ctyhocn: state.focusCtyhocn || "",
     hotel: state.focusHotelName || "",
+    flightOrigins: getIataCodes("flightOrigins").join(", "),
+    flightDestinations: getIataCodes("flightDestinations").join(", "),
+    flightRanges,
+    flightStartDate: flightRanges[0]?.from || "",
+    flightEndDate: flightRanges[0]?.to || "",
+    flightTripType: $("flightTripType")?.value === "oneway" ? "oneway" : "roundtrip",
   };
 }
 
@@ -439,6 +511,390 @@ function formatStayEstimate(amount, currency, nights) {
   const n = Math.max(1, Number(nights) || 1);
   if (!Number.isFinite(rate)) return null;
   return formatMoneyAmount(rate * n, currency);
+}
+
+function hotelStayCashTotal(row) {
+  if (!row || row.amount == null || !Number.isFinite(Number(row.amount))) return null;
+  if (row.inventoryOnly && !row.stayPriced) return null;
+  const nights = stayNightsFor(row);
+  return Number(row.amount) * Math.max(1, Number(nights) || 1);
+}
+
+function hotelSelectButtonHtml(row, key) {
+  const selected = state.selectedHotelKey === key;
+  return `<button
+    type="button"
+    class="trip-select-btn${selected ? " is-selected" : ""}"
+    data-hotel-select="${escapeHtml(key)}"
+    aria-pressed="${selected ? "true" : "false"}"
+  >${selected ? "Selected" : "Select"}</button>`;
+}
+
+function selectHotelForTrip(key) {
+  if (!key) return;
+  const nextKey = state.selectedHotelKey === key ? null : key;
+  state.selectedHotelKey = nextKey;
+  const hotel = nextKey
+    ? state.allRows.find((r) => rowKey(r) === nextKey) ||
+      state.rows.find((r) => rowKey(r) === nextKey) ||
+      null
+    : null;
+  setSelectedStayConstraint(
+    hotel
+      ? {
+          arrivalDate: hotel.arrivalDate,
+          departureDate:
+            hotel.departureDate ||
+            (hotel.arrivalDate
+              ? addDaysISO(hotel.arrivalDate, stayNightsFor(hotel))
+              : null),
+          nights: stayNightsFor(hotel),
+        }
+      : null
+  );
+  syncHotelDateFiltersFromSelection();
+  if (!isHotelSearchMode() && !$("flightResults")?.hidden) {
+    resolveAndHighlightBestTripCombo();
+  } else {
+    refreshTable();
+    updateTripSummary();
+  }
+}
+
+function clearTripHotelSelection({ silent = false } = {}) {
+  state.selectedHotelKey = null;
+  setSelectedStayConstraint(null, { silent });
+  syncHotelDateFiltersFromSelection();
+  if (!silent) {
+    if (!isHotelSearchMode() && !$("flightResults")?.hidden) {
+      resolveAndHighlightBestTripCombo();
+    } else {
+      refreshTable();
+      updateTripSummary();
+    }
+  }
+}
+
+function clearTripSelection() {
+  clearTripHotelSelection({ silent: true });
+  clearTripFlightSelection({ silent: true });
+  syncHotelDateFiltersFromSelection();
+  if (!isHotelSearchMode() && !$("flightResults")?.hidden) {
+    resolveAndHighlightBestTripCombo();
+  } else {
+    refreshFlightTable();
+    refreshTable();
+    updateTripSummary();
+  }
+}
+
+function formatTripCash(amount) {
+  if (amount == null || !Number.isFinite(Number(amount))) return null;
+  return formatMoneyAmount(Number(amount), "USD");
+}
+
+function currentTripSelection() {
+  const { outbound, return: ret } = getSelectedTripFlights();
+  const hotel =
+    state.selectedHotelKey
+      ? state.allRows.find((r) => rowKey(r) === state.selectedHotelKey) ||
+        state.rows.find((r) => rowKey(r) === state.selectedHotelKey) ||
+        null
+      : null;
+  return { outbound, return: ret, hotel };
+}
+
+function isHotelSearchMode(values = null) {
+  return (values || formValues()).searchMode !== "flight";
+}
+
+function isFlightRoundTrip(values = null) {
+  const tripType = (values || formValues()).flightTripType;
+  return tripType !== "oneway";
+}
+
+function currentItineraryDraft() {
+  const { outbound, return: ret, hotel } = currentTripSelection();
+  const values = formValues();
+  const hotelMode = isHotelSearchMode(values);
+  if (!hotel) return null;
+  if (!hotelMode) {
+    const roundTrip = isFlightRoundTrip(values);
+    if (!outbound) return null;
+    if (roundTrip && !ret) return null;
+  }
+
+  let points = 0;
+  let cash = 0;
+  const flights = hotelMode
+    ? []
+    : isFlightRoundTrip(values)
+      ? [outbound, ret]
+      : [outbound];
+  for (const flight of flights) {
+    if (!flight) continue;
+    const miles = Number(flight.mileageCost);
+    if (Number.isFinite(miles)) points += miles;
+    const tax = taxAmountDollars(flight);
+    if (tax != null) cash += tax;
+  }
+  const nights = stayNightsFor(hotel);
+  const stayCash = hotelStayCashTotal(hotel);
+  if (stayCash != null) cash += stayCash;
+  const searchMeta = getFlightResults()?.meta?.search || null;
+  return buildItinerary({
+    outbound: hotelMode ? null : prepareFlightForSave(outbound) || outbound,
+    return: hotelMode || !isFlightRoundTrip(values) ? null : prepareFlightForSave(ret) || ret,
+    hotel: prepareHotelForSave(hotel) || hotel,
+    nights,
+    points,
+    cash,
+    search: hotelMode
+      ? {
+          destinations: values.destination || null,
+          tripType: "hotel",
+        }
+      : searchMeta || {
+          flightOrigins: values.flightOrigins,
+          flightDestinations: values.flightDestinations,
+          flightStartDate: values.flightStartDate,
+          flightEndDate: values.flightEndDate,
+          flightTripType: values.flightTripType,
+        },
+  });
+}
+
+function findSavedForDraft(draft) {
+  if (!draft) return null;
+  const fp = draft.fingerprint || itineraryFingerprint(draft);
+  return (
+    state.savedItineraries.find((e) => (e.fingerprint || itineraryFingerprint(e)) === fp) || null
+  );
+}
+
+function updateTripSaveButton(draft) {
+  const btn = $("tripSummarySave");
+  if (!btn) return;
+  const complete = Boolean(draft);
+  btn.hidden = !complete;
+  btn.disabled = !complete;
+  const existing = findSavedForDraft(draft);
+  const saved = Boolean(existing);
+  btn.classList.toggle("is-saved", saved);
+  btn.setAttribute("aria-pressed", saved ? "true" : "false");
+  btn.setAttribute("aria-label", saved ? "Remove saved itinerary" : "Save itinerary");
+  btn.title = saved ? "Saved — click to remove" : "Save itinerary";
+}
+
+function updateTripSummary() {
+  const bar = $("tripSummary");
+  const totalEl = $("tripSummaryTotal");
+  const linesEl = $("tripSummaryLines");
+  const clearBtn = $("tripSummaryClear");
+  if (!bar || !totalEl || !linesEl) return;
+
+  const hotelMode = isHotelSearchMode();
+  const flightMode = !$("flightResults")?.hidden;
+  const { outbound, return: ret, hotel } = currentTripSelection();
+
+  const hasAny = Boolean(outbound || ret || hotel);
+  bar.hidden = !(flightMode || hasAny);
+  if (clearBtn) clearBtn.hidden = !hasAny;
+  if (!(flightMode || hasAny)) {
+    updateTripSaveButton(null);
+    return;
+  }
+
+  const lines = [];
+  let points = 0;
+  let cash = 0;
+  let hasPoints = false;
+  let hasCash = false;
+
+  const pushFlight = (label, flight) => {
+    if (!flight) {
+      lines.push(
+        `<div class="trip-summary-line is-missing"><span>${label}</span><span>Not selected</span><span class="trip-summary-price">—</span></div>`
+      );
+      return;
+    }
+    const miles = Number(flight.mileageCost);
+    const tax = taxAmountDollars(flight);
+    if (Number.isFinite(miles)) {
+      points += miles;
+      hasPoints = true;
+    }
+    if (tax != null) {
+      cash += tax;
+      hasCash = true;
+    }
+    const route = `${flight.origin || "?"} → ${flight.destination || "?"}`;
+    const program = formatProgramName(flight.source || flight.program) || "Flight";
+    lines.push(
+      `<div class="trip-summary-line"><span>${label}</span><span><strong>${escapeHtml(
+        String(program)
+      )}</strong> · ${escapeHtml(route)}</span><span class="trip-summary-price">${escapeHtml(
+        formatPointsWithTaxes(flight)
+      )}</span></div>`
+    );
+  };
+
+  if (!hotelMode) {
+    pushFlight("Outbound", outbound);
+    if (isFlightRoundTrip()) pushFlight("Return", ret);
+  }
+
+  if (!hotel) {
+    lines.push(
+      `<div class="trip-summary-line is-missing"><span>Hotel</span><span>Not selected</span><span class="trip-summary-price">—</span></div>`
+    );
+  } else {
+    const nights = stayNightsFor(hotel);
+    const stayCash = hotelStayCashTotal(hotel);
+    const estLabel = formatStayEstimate(hotel.amount, hotel.currency, nights);
+    if (stayCash != null) {
+      cash += stayCash;
+      hasCash = true;
+    }
+    lines.push(
+      `<div class="trip-summary-line"><span>Hotel</span><span><strong>${escapeHtml(
+        hotel.hotelName || hotel.ctyhocn || "Hotel"
+      )}</strong> · ${escapeHtml(String(nights))} night${nights === 1 ? "" : "s"}</span><span class="trip-summary-price">${escapeHtml(
+        estLabel ? `est. ${estLabel}` : "—"
+      )}</span></div>`
+    );
+  }
+
+  linesEl.innerHTML = lines.join("");
+
+  const roundTrip = isFlightRoundTrip();
+  const complete = hotelMode
+    ? Boolean(hotel)
+    : Boolean(outbound && hotel && (!roundTrip || ret));
+  const parts = [];
+  if (hasPoints) parts.push(`${formatAwardMiles(points)} pts`);
+  if (hasCash) parts.push(formatTripCash(cash));
+  if (complete && parts.length) {
+    totalEl.textContent = parts.join(" + ");
+  } else if (parts.length) {
+    totalEl.textContent = hotelMode
+      ? `${parts.join(" + ")} · pick a hotel`
+      : roundTrip
+        ? `${parts.join(" + ")} · pick outbound, return, and a hotel`
+        : `${parts.join(" + ")} · pick outbound and a hotel`;
+  } else {
+    totalEl.textContent = hotelMode
+      ? "Select a hotel"
+      : roundTrip
+        ? "Select outbound, return, and a hotel"
+        : "Select outbound and a hotel";
+  }
+
+  updateTripSaveButton(currentItineraryDraft());
+}
+
+async function toggleSaveCurrentItinerary() {
+  const selection = currentTripSelection();
+  const hotelMode = isHotelSearchMode();
+  const roundTrip = isFlightRoundTrip();
+  if (!selection.hotel) return;
+  if (!hotelMode) {
+    if (!selection.outbound) return;
+    if (roundTrip && !selection.return) return;
+  }
+
+  // Removing an already-saved trip does not need hydration.
+  const preview = currentItineraryDraft();
+  if (preview && findSavedForDraft(preview)) {
+    const result = await toggleSavedItinerary(preview);
+    state.savedItineraries = result.list;
+    updateTripSaveButton(currentItineraryDraft());
+    return;
+  }
+
+  // Pull full Search-page detail before saving (flights + hotel rooms/compare).
+  const detailJobs = [ensureHotelRoomsForSave(selection.hotel)];
+  if (!hotelMode) {
+    detailJobs.push(ensureTripDetails(selection.outbound));
+    if (roundTrip && selection.return) detailJobs.push(ensureTripDetails(selection.return));
+  }
+  await Promise.all(detailJobs);
+  const draft = currentItineraryDraft();
+  if (!draft) return;
+  const result = await toggleSavedItinerary(draft);
+  state.savedItineraries = result.list;
+  updateTripSaveButton(currentItineraryDraft());
+}
+
+function hotelBookUrlForSave(hotel) {
+  if (hotel?.bookUrl) return hotel.bookUrl;
+  if (!hotel?.ctyhocn) return null;
+  const url = new URL("https://www.hilton.com/en/book/reservation/rooms/");
+  url.searchParams.set("ctyhocn", hotel.ctyhocn);
+  if (hotel.arrivalDate) url.searchParams.set("arrivalDate", hotel.arrivalDate);
+  if (hotel.departureDate) url.searchParams.set("departureDate", hotel.departureDate);
+  url.searchParams.set("room1NumAdults", "1");
+  return url.toString();
+}
+
+function prepareHotelForSave(hotel) {
+  if (!hotel) return null;
+  const nights = stayNightsFor(hotel);
+  const detailKey = roomDetailKey(hotel);
+  const detail = state.roomDetails.get(detailKey);
+  let compareRate = null;
+  if (!hotel.inventoryOnly && isFamilyAndFriendsRate(hotel) && detail?.rooms?.length) {
+    const sameType = hotel.roomTypeCode
+      ? detail.rooms.filter(
+          (r) =>
+            String(r.roomTypeCode || "").toUpperCase() ===
+            String(hotel.roomTypeCode || "").toUpperCase()
+        )
+      : [];
+    const compare = findNextHigherDifferentPlan(
+      hotel,
+      sameType.length ? sameType : detail.rooms
+    );
+    if (compare) {
+      compareRate = {
+        amount: compare.amount ?? null,
+        amountFmt: compare.amountFmt || null,
+        currency: compare.currency || hotel.currency || null,
+        ratePlanName: compare.ratePlanName || null,
+        ratePlanCode: compare.ratePlanCode || null,
+      };
+    }
+  }
+  return {
+    ...hotel,
+    nights,
+    fromCache: true,
+    fetchedAt: hotel.fetchedAt || Date.now(),
+    bookUrl: hotelBookUrlForSave(hotel),
+    compareRate,
+    roomDetails:
+      detail?.rooms?.length
+        ? {
+            currency: detail.currency || hotel.currency || null,
+            fromCache: Boolean(detail.fromCache),
+            rooms: detail.rooms,
+          }
+        : hotel.roomDetails || null,
+  };
+}
+
+async function ensureHotelRoomsForSave(hotel) {
+  if (!hotel?.ctyhocn || hotel.inventoryOnly) return null;
+  const detailKey = roomDetailKey(hotel);
+  let detail = state.roomDetails.get(detailKey);
+  if (detail?.status === "ok" && detail.rooms?.length) return detail;
+  enqueueRoomRateFetch(hotel, { priority: true });
+  for (let i = 0; i < 40; i += 1) {
+    await new Promise((r) => setTimeout(r, 250));
+    detail = state.roomDetails.get(detailKey);
+    if (detail?.status === "ok" || detail?.status === "error") return detail;
+  }
+  return state.roomDetails.get(detailKey) || null;
 }
 
 function isFamilyAndFriendsRate(rate) {
@@ -759,7 +1215,10 @@ function columnFilterSelected(id) {
 function availableColumnValues(id) {
   const def = columnFilterDef(id);
   if (!def) return [];
-  return [...new Set(rowsMatchingFiltersExcept(id).map((row) => def.value(row)))].sort((a, b) =>
+  const fromResults = rowsMatchingFiltersExcept(id).map((row) => def.value(row));
+  // Keep active selections even when they match zero rows.
+  const selected = [...columnFilterSelected(id)];
+  return [...new Set([...fromResults, ...selected].filter(Boolean))].sort((a, b) =>
     a.localeCompare(b)
   );
 }
@@ -790,8 +1249,55 @@ function filterByColumnFilters(rows) {
   return out;
 }
 
+function filterByTripPair(rows) {
+  // Check-in is applied via the Check-in column filter (synced from selection).
+  // Still enforce check-out when flight/hotel selection implies departure dates.
+  const constraint = getTripPairStayConstraint();
+  if (!constraint?.departureDates?.size) return rows;
+  return rows.filter((row) => {
+    if (row.inventoryOnly) return true;
+    if (row.departureDate && !constraint.departureDates.has(row.departureDate)) return false;
+    return true;
+  });
+}
+
+/** Push selection locks into the hotel Check-in column filter. */
+function syncHotelDateFiltersFromSelection() {
+  const constraint = getTripPairStayConstraint();
+  state.columnFilters.arrivalDate = constraint?.arrivalDates?.size
+    ? new Set([...constraint.arrivalDates].map((d) => String(d).slice(0, 10)))
+    : new Set();
+}
+
 function filterResultRows(rows) {
-  return filterByColumnFilters(filterByDow(rows));
+  return filterByColumnFilters(filterByDow(filterByTripPair(rows)));
+}
+
+function onTripFlightSelectionChange() {
+  syncHotelDateFiltersFromSelection();
+  const constraint = getTripPairStayConstraint();
+  if (state.selectedHotelKey && constraint) {
+    const hotel =
+      state.allRows.find((r) => rowKey(r) === state.selectedHotelKey) || null;
+    const ok =
+      hotel &&
+      (!hotel.arrivalDate ||
+        !constraint.arrivalDates?.size ||
+        constraint.arrivalDates.has(String(hotel.arrivalDate).slice(0, 10))) &&
+      (!hotel.departureDate ||
+        !constraint.departureDates?.size ||
+        constraint.departureDates.has(String(hotel.departureDate).slice(0, 10)));
+    if (!ok) clearTripHotelSelection({ silent: true });
+  }
+  if (!$("flightResults")?.hidden) {
+    // Avoid scoring mid-search (hotels may not be loaded yet).
+    if (state.scanning) {
+      refreshTable();
+      updatePriceOptimalSelectButtons();
+    } else resolveAndHighlightBestTripCombo();
+  } else {
+    updateTripSummary();
+  }
 }
 
 function pruneColumnSelection(id, values) {
@@ -836,7 +1342,7 @@ function updateColumnFilterUi(id = null) {
     const selected = columnFilterSelected(def.id);
     const count = selected.size;
     trigger.classList.toggle("has-filter", count > 0);
-    trigger.disabled = !values.length;
+    trigger.disabled = !values.length && !count;
     if (!count) {
       meta.textContent = "";
     } else if (count <= 2) {
@@ -880,17 +1386,67 @@ function syncColumnFilterFromDom(id) {
   requestAnimationFrame(() => refreshTable());
 }
 
+function mountOverlayPanel(panel) {
+  if (!panel || panel.dataset.overlayMounted === "1") return;
+  panel._overlayParent = panel.parentNode;
+  panel._overlayNext = panel.nextSibling;
+  document.body.appendChild(panel);
+  panel.dataset.overlayMounted = "1";
+}
+
+function unmountOverlayPanel(panel) {
+  if (!panel || panel.dataset.overlayMounted !== "1") return;
+  const parent = panel._overlayParent;
+  const next = panel._overlayNext;
+  if (parent) {
+    if (next && next.parentNode === parent) parent.insertBefore(panel, next);
+    else parent.appendChild(panel);
+  }
+  panel._overlayParent = null;
+  panel._overlayNext = null;
+  delete panel.dataset.overlayMounted;
+  panel.style.left = "";
+  panel.style.top = "";
+  panel.style.width = "";
+}
+
+function pinOverlayPanel(panel, trigger, { width = 220, gap = 6 } = {}) {
+  if (!panel || !trigger || panel.hidden) return;
+  mountOverlayPanel(panel);
+  const rect = trigger.getBoundingClientRect();
+  const w = Math.min(width, window.innerWidth - 16);
+  const left = Math.min(Math.max(8, rect.left), window.innerWidth - w - 8);
+  let top = rect.bottom + gap;
+  const approxH = Math.min(panel.scrollHeight || 240, window.innerHeight * 0.6);
+  if (top + approxH > window.innerHeight - 8) {
+    top = Math.max(8, rect.top - gap - approxH);
+  }
+  panel.style.left = `${left}px`;
+  panel.style.top = `${top}px`;
+  panel.style.width = `${w}px`;
+}
+
 function positionColumnFilterPanel(id) {
   const trigger = document.querySelector(`.col-filter-trigger[data-col-filter="${id}"]`);
   const panel = document.querySelector(`.col-filter-panel[data-col-filter-panel="${id}"]`);
   const def = columnFilterDef(id);
   if (!trigger || !panel || panel.hidden || !def) return;
-  const rect = trigger.getBoundingClientRect();
-  const width = def.panelWidth || 220;
-  const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8);
-  panel.style.left = `${left}px`;
-  panel.style.top = `${rect.bottom + 6}px`;
-  panel.style.width = `${width}px`;
+  pinOverlayPanel(panel, trigger, { width: def.panelWidth || 220 });
+}
+
+function positionDowLikePanel(panelId, triggerId) {
+  const panel = $(panelId);
+  const trigger = $(triggerId);
+  if (!panel || !trigger || panel.hidden) return;
+  pinOverlayPanel(panel, trigger, { width: 280, gap: 8 });
+}
+
+function repositionOpenHotelOverlays() {
+  if (state.openColumnFilter) positionColumnFilterPanel(state.openColumnFilter);
+  if ($("dowPanel") && !$("dowPanel").hidden) positionDowLikePanel("dowPanel", "dowTrigger");
+  if ($("rateTypePanel") && !$("rateTypePanel").hidden) {
+    positionDowLikePanel("rateTypePanel", "rateTypeTrigger");
+  }
 }
 
 function setColumnFilterOpen(id, open) {
@@ -905,9 +1461,11 @@ function setColumnFilterOpen(id, open) {
     const isOpen = Boolean(open) && def.id === id;
     if (isOpen) {
       setDowOpen(false);
+      setRateTypeOpen(false);
       renderColumnFilterList(def.id);
     }
     panel.hidden = !isOpen;
+    if (!isOpen) unmountOverlayPanel(panel);
     trigger.setAttribute("aria-expanded", isOpen ? "true" : "false");
     if (isOpen) positionColumnFilterPanel(def.id);
   }
@@ -963,8 +1521,9 @@ function setupColumnFilters() {
     });
   }
   window.addEventListener("resize", () => {
-    if (state.openColumnFilter) positionColumnFilterPanel(state.openColumnFilter);
+    repositionOpenHotelOverlays();
   });
+  window.addEventListener("scroll", repositionOpenHotelOverlays, true);
   updateColumnFilterUi();
 }
 
@@ -1020,12 +1579,14 @@ function setRateTypeOpen(open) {
   const trigger = $("rateTypeTrigger");
   if (!panel || !trigger) return;
   panel.hidden = !open;
+  if (!open) unmountOverlayPanel(panel);
   trigger.setAttribute("aria-expanded", open ? "true" : "false");
   const chevron = trigger.querySelector(".dow-chevron");
   if (chevron) chevron.textContent = open ? "▴" : "▾";
   if (open) {
     setDowOpen(false);
     closeAllColumnFilters();
+    positionDowLikePanel("rateTypePanel", "rateTypeTrigger");
   }
 }
 
@@ -1056,12 +1617,18 @@ function setupRateTypeFilter() {
 }
 
 function setDowOpen(open) {
-  $("dowPanel").hidden = !open;
-  $("dowTrigger").setAttribute("aria-expanded", open ? "true" : "false");
-  $("dowTrigger").querySelector(".dow-chevron").textContent = open ? "▴" : "▾";
+  const panel = $("dowPanel");
+  const trigger = $("dowTrigger");
+  if (!panel || !trigger) return;
+  panel.hidden = !open;
+  if (!open) unmountOverlayPanel(panel);
+  trigger.setAttribute("aria-expanded", open ? "true" : "false");
+  const chevron = trigger.querySelector(".dow-chevron");
+  if (chevron) chevron.textContent = open ? "▴" : "▾";
   if (open) {
     setRateTypeOpen(false);
     closeAllColumnFilters();
+    positionDowLikePanel("dowPanel", "dowTrigger");
   }
 }
 
@@ -1092,7 +1659,17 @@ function setupDowFilter() {
     state.page = 0;
     refreshTable();
   });
-  document.addEventListener("click", () => {
+  document.addEventListener("click", (e) => {
+    if (
+      e.target.closest(".col-filter") ||
+      e.target.closest("[data-col-filter-panel]") ||
+      e.target.closest("#dowPanel") ||
+      e.target.closest("#rateTypePanel") ||
+      e.target.closest("#dowTrigger") ||
+      e.target.closest("#rateTypeTrigger")
+    ) {
+      return;
+    }
     setDowOpen(false);
     setRateTypeOpen(false);
     closeAllColumnFilters();
@@ -1172,7 +1749,7 @@ function cacheIconHtml(row, key) {
     ? "Refreshing…"
     : captured
       ? `Cached · captured ${captured} — click to refresh`
-      : "Cached (less than 24 hours old) — click to refresh";
+      : "Cached (less than 4 hours old) — click to refresh";
   return `<button
     type="button"
     class="cache-icon${refreshing ? " refreshing" : ""}"
@@ -1355,7 +1932,7 @@ function detailItems(row, compareWith = null) {
     ["Rate code", row.ratePlanCode || "—"],
     ["Room type code", row.roomTypeCode || "—"],
     ["Special rate", row.specialRateType || "—"],
-    ["Source", row.fromCache ? "Cached (< 24h)" : "Live fetch"],
+    ["Source", row.fromCache ? "Cached (< 4h)" : "Live fetch"],
   ].filter(Boolean);
 }
 
@@ -2317,17 +2894,20 @@ function refreshTable() {
   $("exportBtn").disabled = !state.rows.length;
   updateSortHeaders();
 
-  const filtersActive = state.dowSelected.size > 0 || anyColumnFilterActive();
+  const filtersActive =
+    state.dowSelected.size > 0 || anyColumnFilterActive() || Boolean(getTripPairStayConstraint());
 
   if (!state.rows.length) {
     let emptyMsg = state.allRows.length
       ? filtersActive
-        ? "No nights match the current filters."
+        ? getTripPairStayConstraint()
+          ? "No hotel stays match the selected flight dates."
+          : "No nights match the current filters."
         : "No matching Go rates in range."
       : state.scanErrors.length
         ? `No matching nights. ${formatCount(state.scanErrors.length)} hotel request(s) failed.`
         : "No matching Go rates in range.";
-    body.innerHTML = `<tr class="empty"><td colspan="8"><div class="empty-msg">${escapeHtml(
+    body.innerHTML = `<tr class="empty"><td colspan="9"><div class="empty-msg">${escapeHtml(
       emptyMsg
     )}</div>${scanErrorsHtml(state.scanErrors)}</td></tr>`;
     const emptyLabel = state.allRows.length
@@ -2338,6 +2918,7 @@ function refreshTable() {
       : "0 stays • 0 hotels matching";
     setResultsLabel(emptyLabel, { failedCount: state.scanErrors.length });
     updatePagerUi(0);
+    updateTripSummary();
     return;
   }
 
@@ -2387,10 +2968,19 @@ function refreshTable() {
         )
         .join("");
       const dateLabel = row.arrivalDate || "—";
-      return `<tr class="result-row${open ? " open" : ""}" data-row-key="${escapeHtml(key)}" tabindex="0" aria-expanded="${open ? "true" : "false"}">
+      const selected = state.selectedHotelKey === key;
+      const bestCombo = !isHotelSearchMode() && state.bestComboHotelKey === key;
+      const optimalTag = bestCombo
+        ? `<span class="most-optimal-tag" title="Price optimal for this trip">PRICE OPTIMAL</span>`
+        : "";
+      return `<tr class="result-row${open ? " open" : ""}${
+        selected ? " is-trip-selected" : ""
+      }${bestCombo ? " is-best-combo" : ""}" data-row-key="${escapeHtml(key)}" tabindex="0" aria-expanded="${open ? "true" : "false"}">
+        <td class="select-col">${hotelSelectButtonHtml(row, key)}</td>
         <td class="date-cell">${cacheIcon}${escapeHtml(dateLabel)}</td>
         <td>
           <div class="hotel-name">${escapeHtml(row.hotelName)}</div>
+          ${optimalTag}
           <div class="hotel-code">${escapeHtml(row.ctyhocn)}</div>
         </td>
         <td>${escapeHtml(row.brandCode || "—")}</td>
@@ -2405,7 +2995,7 @@ function refreshTable() {
         <td><a class="book-link" href="${escapeHtml(row.bookUrl)}" target="_blank" rel="noopener">Book</a></td>
       </tr>
       <tr class="detail-row${open ? " open" : ""}"${open ? "" : " hidden"}>
-        <td colspan="8">
+        <td colspan="9">
           <div class="detail-panel">
             <dl class="detail-grid">${details}</dl>
             ${open ? roomsSectionHtml(key, row) : ""}
@@ -2417,6 +3007,38 @@ function refreshTable() {
       </tr>`;
     })
     .join("");
+  updateTripSummary();
+}
+
+function setHotelResultsVisible(visible) {
+  setSectionVisible("hotelResults", visible);
+}
+
+function setSectionVisible(id, visible) {
+  const el = $(id);
+  if (!el) return;
+  if (visible) {
+    el.hidden = false;
+    el.removeAttribute("hidden");
+  } else {
+    el.hidden = true;
+    el.setAttribute("hidden", "");
+  }
+}
+
+/** Flight+hotel mode always shows award travel + hotel stays shells; hotel mode hides award travel. */
+function syncFlightHotelResultsLayout() {
+  const flightMode = !isHotelSearchMode();
+  setSectionVisible("flightResultsHeading", flightMode);
+  setSectionVisible("flightResults", flightMode);
+  setSectionVisible("hotelResultsHeading", flightMode);
+  setHotelResultsVisible(true);
+}
+
+function setAwardTravelVisible(visible) {
+  const show = Boolean(visible) && !isHotelSearchMode();
+  setSectionVisible("flightResultsHeading", show);
+  setSectionVisible("flightResults", show);
 }
 
 function renderRows(rows, { syncSession = true, resetPage = false } = {}) {
@@ -2424,6 +3046,16 @@ function renderRows(rows, { syncSession = true, resetPage = false } = {}) {
   if (resetPage) state.page = 0;
   state.scanErrors = incoming.filter((r) => r.error);
   state.allRows = incoming.filter((r) => !r.error);
+  if (
+    state.selectedHotelKey &&
+    !state.allRows.some((r) => rowKey(r) === state.selectedHotelKey)
+  ) {
+    clearTripHotelSelection({ silent: true });
+  }
+  // Show the hotel results card once a search has started or returned rows.
+  if (state.scanning || incoming.length || state.allRows.length || state.scanErrors.length) {
+    setHotelResultsVisible(true);
+  }
   refreshTable();
   // F&F strike-through for stays that already have shopAvail cached locally.
   if (!state.scanning) scheduleHydrateFnfComparesFromCache();
@@ -2553,12 +3185,19 @@ function searchFingerprint(entry) {
     )
     .join(",");
   return [
+    entry.searchMode || "hotel",
     entry.destination || "",
     rangesKey || `${entry.fromDate || ""}_${entry.toDate || ""}`,
     entry.maxRate ?? "",
     entry.minRooms ?? "",
     entry.rateType || "",
     sug?.ctyhocn || sug?.placeId || sug?.query || "",
+    entry.flightOrigins || "",
+    entry.flightDestinations || "",
+    entry.flightStartDate || "",
+    entry.flightEndDate || "",
+    encodeRangesParam(entry.flightRanges || []),
+    entry.flightTripType || "roundtrip",
   ].join("|");
 }
 
@@ -2568,6 +3207,7 @@ function snapshotFromForm() {
   return {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     savedAt: Date.now(),
+    searchMode: values.searchMode,
     destination: values.destination,
     ranges: values.ranges,
     fromDate: values.fromDate,
@@ -2575,6 +3215,12 @@ function snapshotFromForm() {
     maxRate: values.maxRate,
     minRooms: values.minRooms,
     rateType: values.rateType,
+    flightOrigins: values.flightOrigins,
+    flightDestinations: values.flightDestinations,
+    flightStartDate: values.flightStartDate,
+    flightEndDate: values.flightEndDate,
+    flightRanges: values.flightRanges || [],
+    flightTripType: values.flightTripType || "roundtrip",
     selectedSuggestion: sug
       ? {
           type: sug.type || null,
@@ -2594,9 +3240,15 @@ function snapshotFromForm() {
 
 async function rememberCurrentSearch() {
   const entry = snapshotFromForm();
-  if (!entry.destination) return;
-  const cached = /^cached$/i.test(entry.destination) || entry.selectedSuggestion?.type === "cached";
-  if (!cached && !entry.ranges?.length) return;
+  if (entry.searchMode === "flight") {
+    if (!entry.flightOrigins || !entry.flightDestinations) return;
+    const trips = enrichRanges(entry.flightRanges || []);
+    if (!trips.length && !(entry.flightStartDate && entry.flightEndDate)) return;
+  } else {
+    if (!entry.destination) return;
+    const cached = /^cached$/i.test(entry.destination) || entry.selectedSuggestion?.type === "cached";
+    if (!cached && !entry.ranges?.length) return;
+  }
   const fp = searchFingerprint(entry);
   const next = [entry, ...state.recentSearches.filter((r) => searchFingerprint(r) !== fp)];
   await persistRecentSearches(next);
@@ -2608,21 +3260,36 @@ async function removeRecentSearch(id) {
 
 function formatRecentMeta(entry) {
   const bits = [];
-  const ranges =
-    entry.ranges?.length
-      ? entry.ranges
-      : entry.fromDate && entry.toDate
-        ? [{ from: entry.fromDate, to: entry.toDate }]
-        : entry.fromDate && entry.nights
-          ? [{ from: entry.fromDate, to: addDaysISO(entry.fromDate, entry.nights) }]
-          : [];
-  bits.push(formatRangesSummary(ranges));
+  if (entry.searchMode === "flight") {
+    bits.push(entry.flightTripType === "oneway" ? "One-way" : "Round-trip");
+    bits.push(`${entry.flightOrigins || "?"} → ${entry.flightDestinations || "?"}`);
+    const trips = enrichRanges(entry.flightRanges || []);
+    if (trips.length > 1) {
+      bits.push(formatRangesSummary(trips).replace(/stays?/g, "trips"));
+    } else if (trips[0]) {
+      bits.push(`${trips[0].from}→${trips[0].to}`);
+    } else if (entry.flightStartDate && entry.flightEndDate) {
+      bits.push(`${entry.flightStartDate}→${entry.flightEndDate}`);
+    }
+  } else {
+    const ranges =
+      entry.ranges?.length
+        ? entry.ranges
+        : entry.fromDate && entry.toDate
+          ? [{ from: entry.fromDate, to: entry.toDate }]
+          : entry.fromDate && entry.nights
+            ? [{ from: entry.fromDate, to: addDaysISO(entry.fromDate, entry.nights) }]
+            : [];
+    bits.push(formatRangesSummary(ranges));
+  }
   if (entry.maxRate != null && entry.maxRate !== "") bits.push(`max ${entry.maxRate}`);
   bits.push(entry.rateType === "tm" ? "Team Member" : "F&F");
   return bits.join(" · ");
 }
 
 function applySearchSnapshot(entry) {
+  const mode = entry.searchMode === "flight" ? "flight" : "hotel";
+  setSearchMode(mode);
   $("destination").value = entry.destination || "";
   let ranges =
     entry.ranges?.length
@@ -2638,18 +3305,35 @@ function applySearchSnapshot(entry) {
   $("minRooms").value = String(parseMinRooms(entry.minRooms, 1));
   $("rateType").value = entry.rateType || "fnf";
   updateRateTypeUi();
+  if ($("flightOrigins")) setIataCodes("flightOrigins", entry.flightOrigins || "");
+  if ($("flightDestinations")) setIataCodes("flightDestinations", entry.flightDestinations || "");
+  const tripRanges =
+    entry.flightRanges?.length
+      ? entry.flightRanges
+      : entry.flightStartDate && entry.flightEndDate
+        ? [{ from: entry.flightStartDate, to: entry.flightEndDate, mode: "exact" }]
+        : [];
+  setDateRanges(tripRanges, "flightDateRanges");
+  setFlightTripType(entry.flightTripType === "oneway" ? "oneway" : "roundtrip");
   state.selectedSuggestion = entry.selectedSuggestion || null;
   writeParams(formValues());
 }
 
-function filteredRecentSearches(query) {
+function filteredRecentSearches(query, { mode = null } = {}) {
   const q = String(query || "")
     .trim()
     .toLowerCase();
-  if (!q) return state.recentSearches;
-  return state.recentSearches.filter((entry) => {
+  const wantedMode = mode || formValues().searchMode || "hotel";
+  const list = state.recentSearches.filter((entry) => {
+    const entryMode = entry.searchMode === "flight" ? "flight" : "hotel";
+    return entryMode === wantedMode;
+  });
+  if (!q) return list;
+  return list.filter((entry) => {
     const hay = [
       entry.destination,
+      entry.flightOrigins,
+      entry.flightDestinations,
       entry.selectedSuggestion?.primary,
       entry.selectedSuggestion?.secondary,
       entry.selectedSuggestion?.query,
@@ -2686,7 +3370,7 @@ function renderRecentSearches(query = "") {
   const input = $("destination");
   const q = String(query || "").trim().toLowerCase();
   const showCached = !q || "cached".startsWith(q) || q.includes("cach");
-  const recents = filteredRecentSearches(query);
+  const recents = filteredRecentSearches(query, { mode: "hotel" });
   if (!showCached && !recents.length) {
     hideSuggestions();
     return;
@@ -2712,9 +3396,13 @@ function renderRecentSearches(query = "") {
     for (const entry of recents) {
       const idx = flat.length;
       flat.push({ kind: "recent", entry });
+      const primary =
+        entry.searchMode === "flight"
+          ? `${entry.flightOrigins || "?"} → ${entry.flightDestinations || "?"}`
+          : entry.destination;
       html += `<div class="recent-row">
       <button type="button" class="suggest-item recent-item" role="option" data-index="${idx}">
-        <span class="suggest-primary">${escapeHtml(entry.destination)}</span>
+        <span class="suggest-primary">${escapeHtml(primary)}</span>
         <span class="suggest-secondary">${escapeHtml(formatRecentMeta(entry))}</span>
       </button>
       <button type="button" class="recent-remove" data-recent-id="${escapeHtml(
@@ -2751,8 +3439,94 @@ function renderRecentSearches(query = "") {
 }
 
 function selectRecentSearch(entry) {
+  closeFlightRecentPanel();
   hideSuggestions();
   applySearchSnapshot(entry);
+}
+
+function closeFlightRecentPanel() {
+  const panel = $("flightRecentPanel");
+  const btn = $("flightRecentBtn");
+  if (panel) panel.hidden = true;
+  if (btn) btn.setAttribute("aria-expanded", "false");
+}
+
+function renderFlightRecentSearches() {
+  const panel = $("flightRecentPanel");
+  const btn = $("flightRecentBtn");
+  if (!panel || !btn) return;
+  const recents = filteredRecentSearches("", { mode: "flight" });
+  if (!recents.length) {
+    panel.innerHTML = `<div class="suggest-empty">No recent flight + hotel searches yet.</div>`;
+    panel.hidden = false;
+    btn.setAttribute("aria-expanded", "true");
+    return;
+  }
+
+  let html = `<div class="suggest-section"><div class="suggest-section-title">${sectionTitle(
+    "recent"
+  )}</div>`;
+  for (const entry of recents) {
+    const primary = `${entry.flightOrigins || "?"} → ${entry.flightDestinations || "?"}`;
+    html += `<div class="recent-row">
+      <button type="button" class="suggest-item recent-item" role="option" data-recent-apply="${escapeHtml(
+        entry.id
+      )}">
+        <span class="suggest-primary">${escapeHtml(primary)}</span>
+        <span class="suggest-secondary">${escapeHtml(formatRecentMeta(entry))}</span>
+      </button>
+      <button type="button" class="recent-remove" data-recent-id="${escapeHtml(
+        entry.id
+      )}" aria-label="Remove recent search" title="Remove">×</button>
+    </div>`;
+  }
+  html += `</div>`;
+  panel.innerHTML = html;
+  panel.hidden = false;
+  btn.setAttribute("aria-expanded", "true");
+
+  panel.querySelectorAll("[data-recent-apply]").forEach((el) => {
+    el.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const entry = state.recentSearches.find((r) => r.id === el.dataset.recentApply);
+      if (entry) selectRecentSearch(entry);
+    });
+  });
+  panel.querySelectorAll(".recent-remove").forEach((el) => {
+    el.addEventListener("mousedown", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      await removeRecentSearch(el.dataset.recentId);
+      renderFlightRecentSearches();
+    });
+  });
+}
+
+async function toggleFlightRecentPanel() {
+  const panel = $("flightRecentPanel");
+  if (!panel) return;
+  if (!panel.hidden) {
+    closeFlightRecentPanel();
+    return;
+  }
+  await loadRecentSearches();
+  renderFlightRecentSearches();
+}
+
+function setupFlightRecentSearches() {
+  $("flightRecentBtn")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    toggleFlightRecentPanel();
+  });
+  $("flightRecentPanel")?.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", (e) => {
+    if (e.target.closest("#flightRecentBtn, #flightRecentPanel")) return;
+    closeFlightRecentPanel();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeFlightRecentPanel();
+  });
 }
 
 function renderSuggestions(suggestions) {
@@ -2911,6 +3685,410 @@ function setupDestinationAutocomplete() {
   });
 }
 
+const IATA_FIELDS = ["flightOrigins", "flightDestinations"];
+
+const iataTagState = {
+  flightOrigins: [],
+  flightDestinations: [],
+};
+
+function parseIataCodes(value) {
+  return [
+    ...new Set(
+      String(value || "")
+        .toUpperCase()
+        .split(/[\s,;]+/)
+        .map((s) => s.trim())
+        .filter((s) => /^[A-Z]{3}$/.test(s))
+    ),
+  ];
+}
+
+function getIataCodes(fieldId) {
+  return [...(iataTagState[fieldId] || [])];
+}
+
+function iataTagsEl(fieldId) {
+  return $(`${fieldId}Tags`);
+}
+
+function renderIataTags(fieldId) {
+  const tagsEl = iataTagsEl(fieldId);
+  const input = $(fieldId);
+  if (!tagsEl || !input) return;
+  const codes = getIataCodes(fieldId);
+  tagsEl.innerHTML = codes
+    .map(
+      (code) =>
+        `<span class="iata-tag" data-code="${escapeHtml(code)}">
+          <span class="iata-tag-label">${escapeHtml(code)}</span>
+          <button type="button" class="iata-tag-remove" data-remove-iata="${escapeHtml(
+            code
+          )}" aria-label="Remove ${escapeHtml(code)}">×</button>
+        </span>`
+    )
+    .join("");
+  input.placeholder = codes.length ? "" : fieldId === "flightOrigins" ? "SFO" : "JFK";
+  tagsEl.querySelectorAll("[data-remove-iata]").forEach((btn) => {
+    btn.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      removeIataCode(fieldId, btn.getAttribute("data-remove-iata"));
+    });
+  });
+}
+
+function setIataCodes(fieldId, valueOrList) {
+  const codes = Array.isArray(valueOrList) ? valueOrList : parseIataCodes(valueOrList);
+  iataTagState[fieldId] = [
+    ...new Set(codes.map((c) => String(c || "").toUpperCase()).filter((c) => /^[A-Z]{3}$/.test(c))),
+  ];
+  const input = $(fieldId);
+  if (input) input.value = "";
+  renderIataTags(fieldId);
+}
+
+function addIataCode(fieldId, code) {
+  const next = String(code || "").toUpperCase();
+  if (!/^[A-Z]{3}$/.test(next)) return false;
+  const list = getIataCodes(fieldId);
+  if (list.includes(next)) return false;
+  iataTagState[fieldId] = [...list, next];
+  const input = $(fieldId);
+  if (input) input.value = "";
+  renderIataTags(fieldId);
+  writeParams(formValues());
+  updateSeatsApiCostHint();
+  return true;
+}
+
+function removeIataCode(fieldId, code) {
+  const target = String(code || "").toUpperCase();
+  iataTagState[fieldId] = getIataCodes(fieldId).filter((c) => c !== target);
+  renderIataTags(fieldId);
+  writeParams(formValues());
+  updateSeatsApiCostHint();
+  $(fieldId)?.focus();
+}
+
+function commitIataToken(fieldId, { preferSuggestion = false } = {}) {
+  const input = $(fieldId);
+  if (!input) return false;
+  if (preferSuggestion && state.iataIndex >= 0 && state.iataItems[state.iataIndex]) {
+    selectIataSuggestion(fieldId, state.iataItems[state.iataIndex]);
+    return true;
+  }
+  const token = String(input.value || "").trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(token)) return false;
+  const added = addIataCode(fieldId, token);
+  hideIataSuggestions(fieldId);
+  return added;
+}
+
+function iataSuggestPanel(fieldId) {
+  return $(`${fieldId}Suggest`);
+}
+
+function hideIataSuggestions(fieldId = null) {
+  for (const id of IATA_FIELDS) {
+    if (fieldId && id !== fieldId) continue;
+    const panel = iataSuggestPanel(id);
+    const input = $(id);
+    if (!panel || !input) continue;
+    panel.hidden = true;
+    panel.innerHTML = "";
+    input.setAttribute("aria-expanded", "false");
+  }
+  if (!fieldId || state.iataField === fieldId) {
+    state.iataItems = [];
+    state.iataIndex = -1;
+    state.iataField = null;
+  }
+}
+
+function highlightIataSuggestion(index) {
+  const fieldId = state.iataField;
+  const panel = fieldId ? iataSuggestPanel(fieldId) : null;
+  if (!panel) return;
+  const items = panel.querySelectorAll(".suggest-item");
+  items.forEach((el) => el.classList.remove("active"));
+  if (index < 0 || index >= items.length) {
+    state.iataIndex = -1;
+    return;
+  }
+  state.iataIndex = index;
+  items[index].classList.add("active");
+  items[index].scrollIntoView({ block: "nearest" });
+}
+
+function selectIataSuggestion(fieldId, item) {
+  const input = $(fieldId);
+  if (!input || !item) return;
+  if (item.kind === "country" && Array.isArray(item.codes)) {
+    for (const code of item.codes) addIataCode(fieldId, code);
+  } else if (item.code) {
+    addIataCode(fieldId, item.code);
+  } else {
+    return;
+  }
+  hideIataSuggestions(fieldId);
+  input.focus();
+}
+
+function renderIataSuggestions(fieldId, items) {
+  const panel = iataSuggestPanel(fieldId);
+  const input = $(fieldId);
+  if (!panel || !input) return;
+  const existing = new Set(getIataCodes(fieldId));
+  const filtered = items.filter((item) => {
+    if (item?.kind === "country" && Array.isArray(item.codes)) {
+      return item.codes.some((c) => !existing.has(String(c).toUpperCase()));
+    }
+    return item?.code && !existing.has(String(item.code).toUpperCase());
+  });
+  if (!filtered.length) {
+    panel.hidden = true;
+    panel.innerHTML = "";
+    input.setAttribute("aria-expanded", "false");
+    state.iataItems = [];
+    state.iataIndex = -1;
+    state.iataField = null;
+    return;
+  }
+  hideSuggestions();
+  for (const other of IATA_FIELDS) {
+    if (other !== fieldId) hideIataSuggestions(other);
+  }
+  state.iataField = fieldId;
+  state.iataItems = filtered;
+  state.iataIndex = -1;
+  panel.innerHTML = filtered
+    .map((item, idx) => {
+      if (item.kind === "country") {
+        const codes = (item.codes || []).join(", ");
+        return `<button type="button" class="suggest-item suggest-item-country" role="option" data-index="${idx}">
+          <span class="suggest-primary">${escapeHtml(item.name || item.city)}</span>
+          <span class="suggest-secondary">${escapeHtml(codes)}</span>
+        </button>`;
+      }
+      const country = item.countryName || countryLabel(item.country) || item.country || "";
+      const secondary = [item.city, country].filter(Boolean).join(", ");
+      return `<button type="button" class="suggest-item" role="option" data-index="${idx}">
+        <span class="suggest-primary"><span class="iata-code">${escapeHtml(
+          item.code
+        )}</span> · ${escapeHtml(item.name)}</span>
+        <span class="suggest-secondary">${escapeHtml(secondary)}</span>
+      </button>`;
+    })
+    .join("");
+  panel.hidden = false;
+  input.setAttribute("aria-expanded", "true");
+  panel.querySelectorAll(".suggest-item").forEach((btn) => {
+    btn.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const item = state.iataItems[Number(btn.dataset.index)];
+      if (item) selectIataSuggestion(fieldId, item);
+    });
+  });
+}
+
+async function fetchIataSuggestions(fieldId, token) {
+  const reqId = ++state.iataReq;
+  const localRaw = searchAirports(token, { limit: 40 });
+  const isCountryResult = localRaw.some((x) => x?.kind === "country");
+  const local = localRaw.map((entry) => ({
+    code: entry.code,
+    name: entry.name,
+    city: entry.city,
+    country: entry.country,
+    metro: Boolean(entry.metro),
+    kind: entry.kind || null,
+    codes: entry.codes || null,
+    countryName: entry.countryName || null,
+    source: "local",
+  }));
+
+  // Enrich with Hilton airport hits when the token looks like a place name.
+  // Skip when we already expanded a country — local list is the source of truth.
+  let hilton = [];
+  if (!isCountryResult && token.length >= 2) {
+    try {
+      const res = await sendMessage({
+        type: "AUTOCOMPLETE_DESTINATION",
+        query: token,
+        limit: 12,
+      });
+      if (reqId !== state.iataReq) return;
+      if (res?.ok && Array.isArray(res.suggestions)) {
+        const seen = new Set(local.map((x) => x.code).filter(Boolean));
+        for (const s of res.suggestions) {
+          if (s.type && s.type !== "airport" && s.type !== "destination") continue;
+          const code =
+            extractIataCode(s.primary) ||
+            extractIataCode(s.secondary) ||
+            extractIataCode(s.label) ||
+            extractIataCode(s.query);
+          if (!code || seen.has(code)) continue;
+          if (s.type !== "airport" && !/\bairport\b/i.test(`${s.primary} ${s.secondary} ${s.label}`)) {
+            continue;
+          }
+          seen.add(code);
+          hilton.push({
+            code,
+            name: s.primary || s.label || code,
+            city: s.city || s.secondary || "",
+            country: s.countryCode || s.country || "",
+            metro: false,
+            source: "hilton",
+          });
+        }
+      }
+    } catch {
+      /* local list is enough */
+    }
+  }
+  if (reqId !== state.iataReq) return;
+
+  const merged = [...local];
+  for (const hit of hilton) {
+    if (merged.some((x) => x.code === hit.code)) continue;
+    merged.push(hit);
+  }
+  renderIataSuggestions(fieldId, merged.slice(0, isCountryResult ? 40 : 12));
+}
+
+function setupIataAutocomplete() {
+  state.iataItems = [];
+  state.iataIndex = -1;
+  state.iataField = null;
+  state.iataTimer = null;
+  state.iataReq = 0;
+
+  for (const fieldId of IATA_FIELDS) {
+    const input = $(fieldId);
+    const box = document.querySelector(`[data-iata-box="${fieldId}"]`);
+    if (!input) continue;
+
+    renderIataTags(fieldId);
+
+    box?.addEventListener("mousedown", (e) => {
+      if (e.target.closest(".iata-tag-remove")) return;
+      if (e.target === input) return;
+      e.preventDefault();
+      input.focus();
+    });
+
+    input.addEventListener("focus", () => {
+      const token = String(input.value || "").trim();
+      if (token.length >= 1) fetchIataSuggestions(fieldId, token);
+    });
+
+    input.addEventListener("input", () => {
+      const raw = String(input.value || "");
+      // Commit completed codes when the user types a comma/semicolon (keep spaces for city names).
+      if (/[,;]/.test(raw)) {
+        const parts = raw
+          .toUpperCase()
+          .split(/[\s,;]+/)
+          .map((p) => p.trim())
+          .filter(Boolean);
+        const endsWithSep = /[,;]\s*$/.test(raw);
+        const complete = endsWithSep ? parts : parts.slice(0, -1);
+        const remainder = endsWithSep ? "" : parts[parts.length - 1] || "";
+        let changed = false;
+        for (const code of complete) {
+          if (/^[A-Z]{3}$/.test(code) && addIataCode(fieldId, code)) changed = true;
+        }
+        input.value = remainder;
+        if (changed && !remainder) {
+          hideIataSuggestions(fieldId);
+          return;
+        }
+      }
+      const token = String(input.value || "").trim();
+      clearTimeout(state.iataTimer);
+      if (!token) {
+        hideIataSuggestions(fieldId);
+        return;
+      }
+      state.iataTimer = setTimeout(() => fetchIataSuggestions(fieldId, token), 140);
+    });
+
+    input.addEventListener("paste", (e) => {
+      const text = e.clipboardData?.getData("text") || "";
+      const codes = parseIataCodes(text);
+      if (codes.length < 2 && !/[\s,;]/.test(text)) return;
+      e.preventDefault();
+      for (const code of codes) addIataCode(fieldId, code);
+      hideIataSuggestions(fieldId);
+    });
+
+    input.addEventListener("keydown", (e) => {
+      const panel = iataSuggestPanel(fieldId);
+      const panelOpen =
+        panel && !panel.hidden && state.iataItems.length && state.iataField === fieldId;
+
+      if (e.key === "Backspace" && !input.value && getIataCodes(fieldId).length) {
+        e.preventDefault();
+        const codes = getIataCodes(fieldId);
+        removeIataCode(fieldId, codes[codes.length - 1]);
+        return;
+      }
+
+      if (e.key === "Enter" || e.key === "," || e.key === ";") {
+        if (panelOpen && state.iataIndex >= 0) {
+          e.preventDefault();
+          commitIataToken(fieldId, { preferSuggestion: true });
+          return;
+        }
+        const token = String(input.value || "").trim().toUpperCase();
+        if (/^[A-Z]{3}$/.test(token)) {
+          e.preventDefault();
+          commitIataToken(fieldId);
+          return;
+        }
+        if (panelOpen && state.iataItems[0] && e.key === "Enter") {
+          e.preventDefault();
+          selectIataSuggestion(fieldId, state.iataItems[0]);
+          return;
+        }
+      }
+
+      if (!panelOpen) {
+        if (e.key === "Escape") hideIataSuggestions(fieldId);
+        return;
+      }
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        highlightIataSuggestion(Math.min(state.iataIndex + 1, state.iataItems.length - 1));
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        highlightIataSuggestion(Math.max(state.iataIndex - 1, 0));
+      } else if (e.key === "Enter" && state.iataIndex >= 0) {
+        e.preventDefault();
+        const item = state.iataItems[state.iataIndex];
+        if (item) selectIataSuggestion(fieldId, item);
+      } else if (e.key === "Escape") {
+        hideIataSuggestions(fieldId);
+      } else if (e.key === "Tab" && (state.iataIndex >= 0 || state.iataItems[0])) {
+        const item = state.iataItems[state.iataIndex >= 0 ? state.iataIndex : 0];
+        if (item) {
+          e.preventDefault();
+          selectIataSuggestion(fieldId, item);
+        }
+      }
+    });
+
+    input.addEventListener("blur", () => {
+      setTimeout(() => {
+        const token = String(input.value || "").trim().toUpperCase();
+        if (/^[A-Z]{3}$/.test(token)) commitIataToken(fieldId);
+        hideIataSuggestions(fieldId);
+      }, 140);
+    });
+  }
+}
+
 function nightsLabel(nights) {
   const n = Number(nights) || 1;
   return n === 1 ? "1-night" : `${n}-night`;
@@ -2918,22 +4096,914 @@ function nightsLabel(nights) {
 
 function setScanningUi(scanning) {
   state.scanning = scanning;
-  const btn = $("searchBtn");
-  if (scanning) {
-    btn.type = "button";
-    btn.textContent = "Stop";
-    btn.classList.remove("search-btn");
-    btn.classList.add("stop-btn");
-    btn.setAttribute("aria-label", "Stop search");
-  } else {
+  for (const id of ["searchBtn", "flightSearchBtn"]) {
+    const btn = $(id);
+    if (!btn) continue;
+    if (scanning) {
+      btn.type = "button";
+      btn.textContent = "Stop";
+      btn.classList.remove("search-btn");
+      btn.classList.add("stop-btn");
+      btn.setAttribute("aria-label", "Stop search");
+    } else {
+      btn.type = "submit";
+      btn.textContent = "Search";
+      btn.classList.remove("stop-btn");
+      btn.classList.add("search-btn");
+      btn.setAttribute("aria-label", "Search");
+    }
+  }
+  if (scanning) setHotelResultsVisible(true);
+  if (!scanning) {
     clearRoomFetchQueue();
-    btn.type = "submit";
-    btn.textContent = "Search";
-    btn.classList.remove("stop-btn");
-    btn.classList.add("search-btn");
-    btn.setAttribute("aria-label", "Search");
     scheduleHydrateFnfComparesFromCache();
   }
+  updatePriceOptimalSelectButtons();
+}
+
+function estimateSeatsSearchCalls(values = formValues()) {
+  const roundTrip = values.flightTripType !== "oneway";
+  const origins = parseIataCodes(values.flightOrigins);
+  const destinations = parseIataCodes(values.flightDestinations);
+  const tripRanges = enrichRanges(values.flightRanges || []).filter(
+    (r) => r?.from && r?.to && r.to > r.from
+  );
+  if (!tripRanges.length || !origins.length || !destinations.length) {
+    return {
+      total: 0,
+      outbound: 0,
+      returning: 0,
+      trips: tripRanges.length,
+      originCount: origins.length,
+      destinationCount: destinations.length,
+      departureDates: 0,
+      returnDates: 0,
+      roundTrip,
+    };
+  }
+  // One Seats /search request per unique date per leg; airports are comma-batched.
+  const departureDates = new Set(tripRanges.map((r) => r.from)).size;
+  const returnDates = roundTrip ? new Set(tripRanges.map((r) => r.to)).size : 0;
+  return {
+    total: departureDates + returnDates,
+    outbound: departureDates,
+    returning: returnDates,
+    trips: tripRanges.length,
+    originCount: origins.length,
+    destinationCount: destinations.length,
+    departureDates,
+    returnDates,
+    roundTrip,
+  };
+}
+
+function updateSeatsApiCostHint() {
+  const el = $("seatsApiCostHint");
+  if (!el) return;
+  if ($("searchMode")?.value !== "flight") {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const est = estimateSeatsSearchCalls();
+  if (!est.trips) {
+    el.textContent = "Add trips to estimate Seats.aero API cost.";
+    return;
+  }
+  if (!est.originCount || !est.destinationCount) {
+    el.hidden = true;
+    return;
+  }
+  el.textContent = `~${formatCount(est.total)} Seats.aero API call${
+    est.total === 1 ? "" : "s"
+  }`;
+}
+
+function setFlightTripType(type, { writeUrl = false } = {}) {
+  const next = type === "oneway" ? "oneway" : "roundtrip";
+  if ($("flightTripType")) $("flightTripType").value = next;
+  document.querySelectorAll("[data-flight-trip-type]").forEach((btn) => {
+    const active = btn.dataset.flightTripType === next;
+    btn.classList.toggle("is-active", active);
+    btn.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  const tripsLabel = $("flightTripsLabel");
+  if (tripsLabel) tripsLabel.textContent = "Trips";
+  setDateRangesHints("flightDateRanges", {
+    exactStart: "Select departure",
+    exactEnd: next === "oneway" ? "Select check-out" : "Select return",
+  });
+  setDateRangesPlaceholder(
+    "flightDateRanges",
+    next === "oneway" ? "Add departure → check-out" : "Add departure → return"
+  );
+  const returnSection = document.querySelector('.flight-leg-section[data-flight-leg="return"]');
+  if (returnSection) returnSection.hidden = next === "oneway";
+  if (next === "oneway") clearSelectedReturnFlight({ silent: false });
+  const lede = $("heroLede");
+  if (lede && $("searchMode")?.value === "flight") {
+    lede.textContent =
+      next === "oneway"
+        ? "Find award flights on your departure dates, then scan Hilton hotels through check-out."
+        : "Find award flights for each trip window, then scan Hilton hotels for those stays.";
+  }
+  if ($("searchMode")?.value === "flight") {
+    setStatus(
+      next === "oneway"
+        ? "Enter airports and one or more departure → check-out trips."
+        : "Enter airports and one or more departure → return trips."
+    );
+  }
+  updateTripSummary();
+  updateSeatsApiCostHint();
+  if (writeUrl) writeParams(formValues());
+}
+
+function setSearchMode(mode) {
+  const next = mode === "flight" ? "flight" : "hotel";
+  if ($("searchMode")) $("searchMode").value = next;
+  document.querySelectorAll("[data-search-mode]").forEach((btn) => {
+    const active = btn.dataset.searchMode === next;
+    btn.classList.toggle("is-active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  document.querySelectorAll("[data-mode-panel]").forEach((panel) => {
+    panel.hidden = panel.dataset.modePanel !== next;
+  });
+  if (next !== "flight") closeFlightRecentPanel();
+  const tripType = $("flightTripType")?.value === "oneway" ? "oneway" : "roundtrip";
+  const lede = $("heroLede");
+  if (lede) {
+    lede.textContent =
+      next === "flight"
+        ? tripType === "oneway"
+          ? "Find award flights for each departure → check-out trip, then scan Hilton hotels."
+          : "Find award flights for each departure → return trip, then scan Hilton hotels."
+        : "Add one or more stays.";
+  }
+  if ($("destination")) $("destination").required = next === "hotel";
+  if (next === "flight") {
+    const returnSection = document.querySelector('.flight-leg-section[data-flight-leg="return"]');
+    if (returnSection) returnSection.hidden = tripType === "oneway";
+  }
+  setStatus(
+    next === "flight"
+      ? tripType === "oneway"
+        ? "Enter airports and one or more departure → check-out trips."
+        : "Enter airports and one or more departure → return trips."
+      : "Enter a destination and at least one stay to begin."
+  );
+  updateSeatsApiCostHint();
+  if (next !== "flight") {
+    clearBestTripComboHighlight();
+    const notice = $("bestComboNotice");
+    if (notice) {
+      notice.hidden = true;
+      notice.textContent = "";
+    }
+  }
+  syncFlightHotelResultsLayout();
+  updateTripSummary();
+  updatePriceOptimalSelectButtons();
+  refreshTable();
+}
+
+function setupSearchMode() {
+  document.querySelectorAll("[data-search-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (state.scanning) return;
+      setSearchMode(btn.dataset.searchMode);
+      writeParams(formValues());
+    });
+  });
+  document.querySelectorAll("[data-flight-trip-type]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (state.scanning) return;
+      setFlightTripType(btn.dataset.flightTripType, { writeUrl: true });
+    });
+  });
+}
+
+function renderFlightResults(flights, meta = {}) {
+  setFlightResults(flights, meta);
+  syncFlightHotelResultsLayout();
+  updatePriceOptimalSelectButtons();
+}
+
+function clearFlightResultsUi() {
+  clearFlightResults();
+  clearTripHotelSelection({ silent: true });
+  clearBestTripComboHighlight();
+  // Keep both table shells visible in Flight + hotel mode (empty state).
+  syncFlightHotelResultsLayout();
+  updateTripSummary();
+}
+
+function flightAwardCost(flight) {
+  const miles = Number(flight?.mileageCost);
+  if (!Number.isFinite(miles) || miles < 0) return null;
+  const tax = taxAmountDollars(flight);
+  return { points: miles, cash: tax != null ? tax : 0 };
+}
+
+function hotelDepartureFor(row) {
+  if (!row) return null;
+  if (row.departureDate) return String(row.departureDate).slice(0, 10);
+  if (row.arrivalDate) {
+    return addDaysISO(String(row.arrivalDate).slice(0, 10), stayNightsFor(row));
+  }
+  return null;
+}
+
+/**
+ * Cheapest outbound (+ return) + hotel stay for searched trip windows.
+ * Cost = (award miles × $0.01) + flight taxes + hotel stay cash (USD).
+ * Optional locks fix a chosen leg/stay; remaining legs are re-optimized.
+ */
+function findCheapestTripCombo({
+  flights,
+  hotels,
+  tripRanges,
+  roundTrip,
+  lockOutboundId = null,
+  lockReturnId = null,
+  lockHotelKey = null,
+} = {}) {
+  const MILE_VALUE_USD = 0.01;
+  const ranges = (tripRanges || []).filter((t) => t?.from && t?.to && t.to > t.from);
+  if (!ranges.length) return null;
+
+  const lockOut = lockOutboundId != null ? String(lockOutboundId) : null;
+  const lockRet = lockReturnId != null ? String(lockReturnId) : null;
+  const lockHotel = lockHotelKey != null ? String(lockHotelKey) : null;
+
+  const outsByDate = new Map();
+  const retsByDate = new Map();
+  for (const flight of flights || []) {
+    const date = String(flight?.date || "").slice(0, 10);
+    if (!date) continue;
+    const isReturn = flight.direction === "return";
+    if (isReturn) {
+      if (!roundTrip) continue;
+      if (lockRet && String(flight.id) !== lockRet) continue;
+      const list = retsByDate.get(date) || [];
+      list.push(flight);
+      retsByDate.set(date, list);
+    } else {
+      if (lockOut && String(flight.id) !== lockOut) continue;
+      const list = outsByDate.get(date) || [];
+      list.push(flight);
+      outsByDate.set(date, list);
+    }
+  }
+
+  const hotelsByStay = new Map();
+  for (const hotel of hotels || []) {
+    if (hotel?.error) continue;
+    if (lockHotel && rowKey(hotel) !== lockHotel) continue;
+    const stayCash = hotelStayCashTotal(hotel);
+    if (stayCash == null) continue;
+    const arrival = String(hotel.arrivalDate || "").slice(0, 10);
+    const departure = hotelDepartureFor(hotel);
+    if (!arrival || !departure) continue;
+    const key = `${arrival}|${departure}`;
+    const list = hotelsByStay.get(key) || [];
+    list.push({ hotel, stayCash });
+    hotelsByStay.set(key, list);
+  }
+
+  let best = null;
+
+  for (const trip of ranges) {
+    const from = String(trip.from).slice(0, 10);
+    const to = String(trip.to).slice(0, 10);
+    const outs = outsByDate.get(from) || [];
+    const stays = hotelsByStay.get(`${from}|${to}`) || [];
+    if (!outs.length || !stays.length) continue;
+
+    const rets = roundTrip ? retsByDate.get(to) || [] : [null];
+    if (roundTrip && !rets.length) continue;
+
+    for (const outbound of outs) {
+      const outCost = flightAwardCost(outbound);
+      if (!outCost) continue;
+      for (const ret of rets) {
+        let retCost = { points: 0, cash: 0 };
+        if (roundTrip) {
+          retCost = flightAwardCost(ret);
+          if (!retCost) continue;
+        }
+        for (const { hotel, stayCash } of stays) {
+          const points = outCost.points + retCost.points;
+          const cash = outCost.cash + retCost.cash + stayCash;
+          const total = points * MILE_VALUE_USD + cash;
+          if (!best || total < best.total) {
+            best = {
+              outbound,
+              return: roundTrip ? ret : null,
+              hotel,
+              points,
+              cash,
+              total,
+            };
+          }
+        }
+      }
+    }
+  }
+
+  return best;
+}
+
+function setBestComboNotice(message) {
+  const el = $("bestComboNotice");
+  if (!el) return;
+  if (!message) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  el.hidden = false;
+  el.textContent = message;
+}
+
+function clearBestTripComboHighlight() {
+  state.bestComboHotelKey = null;
+  clearBestComboFlightIds();
+  setBestComboNotice(null);
+  updatePriceOptimalSelectButtons();
+}
+
+function hasPriceOptimalCombo({ roundTrip = isFlightRoundTrip() } = {}) {
+  if (isHotelSearchMode()) return false;
+  const { outboundId, returnId } = getBestComboFlightIds();
+  if (!outboundId || !state.bestComboHotelKey) return false;
+  if (roundTrip && !returnId) return false;
+  return true;
+}
+
+function priceOptimalSelectDisabledReason() {
+  if (hasPriceOptimalCombo()) return "";
+  if (isHotelSearchMode()) {
+    return "Price-optimal selection is only available in Flight + hotel mode.";
+  }
+  if (state.scanning) {
+    const hasFlights = Boolean(getFlightResults()?.all?.length);
+    return hasFlights
+      ? "Hotel search is still in progress."
+      : "Search is still in progress.";
+  }
+  const flightMode = !$("flightResults")?.hidden;
+  if (!flightMode || !getFlightResults()?.all?.length) {
+    return "Run a Flight + hotel search to find a price-optimal combination.";
+  }
+  if (!state.allRows?.length) {
+    return "No hotel rates available — a price-optimal combination is not possible.";
+  }
+  const notice = $("bestComboNotice");
+  if (notice && !notice.hidden && notice.textContent?.trim()) {
+    return notice.textContent.trim();
+  }
+  return "A price-optimal combination is not possible for these results.";
+}
+
+function updatePriceOptimalSelectButtons() {
+  const hotelMode = isHotelSearchMode();
+  const enabled = hasPriceOptimalCombo();
+  const reason = priceOptimalSelectDisabledReason();
+  const pairs = [
+    ["selectPriceOptimalFlightBtn", "selectPriceOptimalFlightWrap"],
+    ["selectPriceOptimalHotelBtn", "selectPriceOptimalHotelWrap"],
+  ];
+  for (const [btnId, wrapId] of pairs) {
+    const btn = $(btnId);
+    const wrap = $(wrapId);
+    if (!btn) continue;
+    btn.disabled = !enabled;
+    btn.removeAttribute("title");
+    if (wrap) {
+      wrap.hidden = hotelMode;
+      wrap.title = enabled || hotelMode ? "" : reason;
+      wrap.classList.toggle("is-disabled", !enabled);
+    } else if (!enabled) {
+      btn.title = reason;
+    }
+  }
+}
+
+function selectPriceOptimalTripCombo() {
+  if (isHotelSearchMode() || !hasPriceOptimalCombo()) return;
+  const { outboundId, returnId } = getBestComboFlightIds();
+  const hotelKey = state.bestComboHotelKey;
+  const roundTrip = isFlightRoundTrip();
+  const hotel =
+    state.allRows.find((r) => rowKey(r) === hotelKey) ||
+    state.rows.find((r) => rowKey(r) === hotelKey) ||
+    null;
+  if (!hotel) return;
+
+  setTripFlightSelection({
+    outboundId,
+    returnId: roundTrip ? returnId : null,
+    silent: true,
+  });
+  state.selectedHotelKey = hotelKey;
+  setSelectedStayConstraint(
+    {
+      arrivalDate: hotel.arrivalDate,
+      departureDate:
+        hotel.departureDate ||
+        (hotel.arrivalDate ? addDaysISO(hotel.arrivalDate, stayNightsFor(hotel)) : null),
+      nights: stayNightsFor(hotel),
+    },
+    { silent: true }
+  );
+  syncHotelDateFiltersFromSelection();
+  resolveAndHighlightBestTripCombo({ roundTrip });
+}
+
+function applyBestTripCombo(combo, { roundTrip = true, hasLocks = false } = {}) {
+  if (!combo?.outbound || !combo?.hotel || (roundTrip && !combo.return)) {
+    state.bestComboHotelKey = null;
+    clearBestComboFlightIds();
+    setBestComboNotice(
+      hasLocks
+        ? roundTrip
+          ? "No cheapest outbound, return, and hotel combination works with your current selection."
+          : "No cheapest outbound and hotel combination works with your current selection."
+        : roundTrip
+          ? "A cheapest combination of outbound, return, and hotel stay could not be found for these trip dates."
+          : "A cheapest combination of outbound flight and hotel stay could not be found for these trip dates."
+    );
+    updatePriceOptimalSelectButtons();
+    refreshFlightTable();
+    refreshTable();
+    return null;
+  }
+
+  state.bestComboHotelKey = rowKey(combo.hotel);
+  setBestComboFlightIds({
+    outboundId: combo.outbound.id,
+    returnId: combo.return?.id || null,
+  });
+  setBestComboNotice(null);
+  updatePriceOptimalSelectButtons();
+  refreshFlightTable();
+  refreshTable();
+  return combo;
+}
+
+function resolveAndHighlightBestTripCombo({ roundTrip } = {}) {
+  if (isHotelSearchMode()) {
+    clearBestTripComboHighlight();
+    refreshFlightTable();
+    refreshTable();
+    return null;
+  }
+  const flightData = getFlightResults();
+  if (!flightData?.all?.length) {
+    clearBestTripComboHighlight();
+    return null;
+  }
+  const flights = flightData.all || [];
+  const tripRanges = flightData?.meta?.search?.tripRanges || [];
+  const isRound =
+    roundTrip != null
+      ? Boolean(roundTrip)
+      : String(flightData?.meta?.search?.tripType || "") !== "oneway";
+  const hotels = state.allRows || [];
+  const { outbound, return: ret, hotel } = currentTripSelection();
+  const hasLocks = Boolean(outbound || ret || hotel);
+  const combo = findCheapestTripCombo({
+    flights,
+    hotels,
+    tripRanges,
+    roundTrip: isRound,
+    lockOutboundId: outbound?.id || null,
+    lockReturnId: isRound ? ret?.id || null : null,
+    lockHotelKey: hotel ? rowKey(hotel) : null,
+  });
+  return applyBestTripCombo(combo, { roundTrip: isRound, hasLocks });
+}
+
+async function resolveAirportHotels(iata) {
+  const code = String(iata || "").toUpperCase();
+  if (!/^[A-Z]{3}$/.test(code)) return { hotels: [], placeLabel: code };
+
+  let suggestion = null;
+  const ac = await sendMessage({
+    type: "AUTOCOMPLETE_DESTINATION",
+    query: code,
+    limit: 12,
+  });
+  if (ac.ok && ac.suggestions?.length) {
+    suggestion =
+      ac.suggestions.find(
+        (s) =>
+          s.type === "airport" &&
+          (String(s.primary || "").toUpperCase().includes(code) ||
+            String(s.query || "").toUpperCase().includes(code) ||
+            String(s.label || "").toUpperCase().includes(code))
+      ) ||
+      ac.suggestions.find((s) => s.type === "airport") ||
+      pickBestDestinationSuggestion(ac.suggestions, code);
+  }
+
+  const hotelRes = await sendMessage({
+    type: "SEARCH_DESTINATION_HOTELS",
+    destination: suggestion?.query || code,
+    suggestion,
+  });
+  if (!hotelRes.ok) {
+    if (hotelRes.unauthorized) throw Object.assign(new Error(hotelRes.error || "Unauthorized"), { unauthorized: true });
+    throw new Error(hotelRes.error || `Hotel search failed for ${code}`);
+  }
+  return {
+    hotels: hotelRes.hotels || [],
+    placeLabel:
+      hotelRes.place?.displayName ||
+      hotelRes.resolvedSuggestion?.label ||
+      suggestion?.label ||
+      code,
+    cancelled: Boolean(hotelRes.cancelled),
+  };
+}
+
+function mergeHotelsByCode(lists) {
+  const map = new Map();
+  for (const hotels of lists) {
+    for (const h of hotels || []) {
+      const code = String(h?.ctyhocn || "").toUpperCase();
+      if (!code || map.has(code)) continue;
+      map.set(code, h);
+    }
+  }
+  return [...map.values()];
+}
+
+async function runFlightHotelSearch(values) {
+  if (!values.flightOrigins) {
+    setStatus("Origin airport(s) required (e.g. SFO, OAK).");
+    return;
+  }
+  if (!values.flightDestinations) {
+    setStatus("Destination airport(s) required (e.g. LHR, LGW).");
+    return;
+  }
+  const roundTrip = values.flightTripType !== "oneway";
+  const tripRanges = enrichRanges(values.flightRanges || []).filter(
+    (r) => r?.from && r?.to && r.to > r.from
+  );
+  if (!tripRanges.length) {
+    setStatus(
+      roundTrip
+        ? "Add at least one departure → return trip."
+        : "Add at least one departure → check-out trip."
+    );
+    return;
+  }
+  const tooLong = tripRanges.find((r) => (r.nights || nightsBetween(r.from, r.to)) > 7);
+  if (tooLong) {
+    const n = tooLong.nights || nightsBetween(tooLong.from, tooLong.to);
+    setStatus(`Hotel stays can be at most 7 nights (got ${n} for ${tooLong.from}→${tooLong.to}).`);
+    return;
+  }
+
+  writeParams(values);
+  rememberCurrentSearch();
+  state.stopRequested = false;
+  clearRoomFetchQueue();
+  state.expanded.clear();
+  state.roomGroupsOpen.clear();
+  state.roomsSectionOpen.clear();
+  state.roomDescOpen.clear();
+  state.refreshingKeys.clear();
+  clearColumnFilters();
+  state.dowSelected = new Set();
+  updateDowUi();
+  setScanningUi(true);
+  setProgress(0);
+  hideSuggestions();
+  state.scanHotels = [];
+  state.scanProgressDone = 0;
+  clearFlightResultsUi();
+  renderRows([], { resetPage: true });
+  clearBestTripComboHighlight();
+
+  try {
+    const status = await sendMessage({ type: "GET_STATUS" });
+    if (status.unauthorized || state.awaitingReauth) {
+      state.awaitingReauth = false;
+      const restored = await sendMessage({ type: "RESTORE_SESSION" });
+      if (restored.guestId) setSession(restored.guestId, { userName: restored.userName || null });
+    }
+
+    const tripLabel = `${formatCount(tripRanges.length)} trip${tripRanges.length === 1 ? "" : "s"}`;
+    setStatus(
+      roundTrip
+        ? `Searching Seats.aero for ${tripLabel} (outbound + return)…`
+        : `Searching Seats.aero for ${tripLabel} (outbound)…`
+    );
+    setProgress(8);
+
+    const seatsCommon = {
+      type: "SEATS_CACHED_SEARCH",
+      transferPartners: "all",
+    };
+
+    const departureDates = [...new Set(tripRanges.map((r) => r.from))];
+    const returnDates = roundTrip ? [...new Set(tripRanges.map((r) => r.to))] : [];
+
+    // Map each departure date to hotel stay end dates so Seats can build stay windows.
+    const stayEndByDepart = new Map();
+    for (const trip of tripRanges) {
+      const ends = stayEndByDepart.get(trip.from) || [];
+      if (!ends.includes(trip.to)) ends.push(trip.to);
+      stayEndByDepart.set(trip.from, ends);
+    }
+
+    const outboundJobs = departureDates.map((depart) => {
+      // Prefer the shortest matching stay for this depart when seeding hotel stays;
+      // all trip windows are still scanned for hotels later.
+      const ends = (stayEndByDepart.get(depart) || []).slice().sort();
+      const stayEnd = ends[0] || addDaysISO(depart, 1);
+      return sendMessage({
+        ...seatsCommon,
+        originAirports: values.flightOrigins,
+        destinationAirports: values.flightDestinations,
+        startDate: depart,
+        endDate: depart,
+        arrivalDate: depart,
+        departureDate: stayEnd,
+      }).then((res) => ({ depart, res }));
+    });
+
+    const returnJobs = returnDates.map((retDate) =>
+      sendMessage({
+        ...seatsCommon,
+        originAirports: values.flightDestinations,
+        destinationAirports: values.flightOrigins,
+        startDate: retDate,
+        endDate: retDate,
+        arrivalDate: null,
+        departureDate: null,
+      }).then((res) => ({ retDate, res }))
+    );
+
+    const [outboundResults, returnResults] = await Promise.all([
+      Promise.all(outboundJobs),
+      Promise.all(returnJobs),
+    ]);
+
+    if (state.stopRequested) {
+      setStatus("Stopped.");
+      return;
+    }
+
+    const seatsError = [...outboundResults, ...returnResults]
+      .map((x) => x.res)
+      .find((r) => !r?.ok);
+    if (seatsError) {
+      if (seatsError.code === "missing_api_key") {
+        const details = document.querySelector(".seats-key-details");
+        if (details) details.open = true;
+      }
+      throw new Error(seatsError.error || "Seats.aero search failed");
+    }
+
+    const tagLeg = (list, direction, searchMeta = {}) =>
+      (list || []).map((f, i) => ({
+        ...f,
+        direction,
+        fromCache: Boolean(searchMeta.fromCache),
+        fetchedAt: searchMeta.fetchedAt || null,
+        id: `${direction}:${f.id || `${f.source}-${f.date}-${f.origin}-${f.destination}-${i}`}`,
+      }));
+
+    const outboundFlights = [];
+    const returnFlights = [];
+    const destinations = new Set();
+    let anyOutCached = false;
+    let anyRetCached = false;
+
+    for (const { res } of outboundResults) {
+      if (res.fromCache) anyOutCached = true;
+      const tagged = tagLeg(res.flights, "outbound", {
+        fromCache: res.fromCache,
+        fetchedAt: res.fetchedAt,
+      });
+      outboundFlights.push(...tagged);
+      for (const code of res.destinationsWithFlights || []) {
+        if (code) destinations.add(String(code).toUpperCase());
+      }
+      for (const f of tagged) {
+        if (f.destination) destinations.add(String(f.destination).toUpperCase());
+      }
+    }
+    for (const { res } of returnResults) {
+      if (res.fromCache) anyRetCached = true;
+      returnFlights.push(
+        ...tagLeg(res.flights, "return", {
+          fromCache: res.fromCache,
+          fetchedAt: res.fetchedAt,
+        })
+      );
+    }
+
+    // Deduplicate identical award rows across trip dates.
+    const dedupeFlights = (list) => {
+      const seen = new Set();
+      const out = [];
+      for (const f of list) {
+        const key = f.id || JSON.stringify(f);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(f);
+      }
+      return out;
+    };
+    const outboundUnique = dedupeFlights(outboundFlights);
+    const returnUnique = dedupeFlights(returnFlights);
+    const flights = [...outboundUnique, ...returnUnique];
+    const cacheBits = [];
+    if (anyOutCached) cacheBits.push("out cached");
+    if (roundTrip && anyRetCached) cacheBits.push("ret cached");
+    const flightCacheNote = cacheBits.length ? ` · ${cacheBits.join(", ")}` : "";
+
+    // Actual Seats HTTP /search calls (airports batched; cache hits = 0).
+    let seatsApiCallsSpent = 0;
+    for (const { res } of [...outboundResults, ...returnResults]) {
+      if (!res?.ok) continue;
+      if (typeof res.apiCalls === "number") seatsApiCallsSpent += res.apiCalls;
+      else if (!res.fromCache) seatsApiCallsSpent += 1;
+    }
+
+    const destinationList = [...destinations];
+    renderFlightResults(flights, {
+      destinations: destinationList,
+      transferPartners: "all",
+      outboundCount: outboundUnique.length,
+      returnCount: returnUnique.length,
+      seatsApiCallsSpent,
+      search: {
+        origins: values.flightOrigins,
+        destinations: values.flightDestinations,
+        departureDate: tripRanges[0].from,
+        returnDate: tripRanges[0].to,
+        tripRanges,
+        tripType: roundTrip ? "roundtrip" : "oneway",
+        transferPartners: "all",
+      },
+    });
+
+    const uniqueRanges = tripRanges.map((r) => ({
+      from: r.from,
+      to: r.to,
+      nights: r.nights || nightsBetween(r.from, r.to),
+      mode: "exact",
+    }));
+
+    if (!outboundUnique.length && !returnUnique.length) {
+      setProgress(100);
+      setStatus(
+        roundTrip
+          ? `No award availability ${values.flightOrigins} ⇄ ${values.flightDestinations} across ${tripLabel}${flightCacheNote}.`
+          : `No award availability ${values.flightOrigins} → ${values.flightDestinations} across ${tripLabel}${flightCacheNote}.`
+      );
+      applyBestTripCombo(null, { roundTrip });
+      return;
+    }
+
+    if (!outboundUnique.length || !uniqueRanges.length) {
+      setProgress(100);
+      setStatus(
+        `Found ${formatCount(flights.length)} award flight${flights.length === 1 ? "" : "s"}${flightCacheNote} (${formatCount(
+          outboundUnique.length
+        )} outbound${roundTrip ? ` · ${formatCount(returnUnique.length)} return` : ""}). No outbound awards for hotel search.`
+      );
+      applyBestTripCombo(null, { roundTrip });
+      return;
+    }
+
+    setStatus(
+      `Found ${formatCount(outboundUnique.length)} outbound${
+        roundTrip ? ` · ${formatCount(returnUnique.length)} return` : ""
+      }${flightCacheNote} · ${formatCount(uniqueRanges.length)} hotel stay${
+        uniqueRanges.length === 1 ? "" : "s"
+      }. Finding Hilton hotels…`
+    );
+    setProgress(18);
+
+    const hotelLists = [];
+    for (let i = 0; i < destinationList.length; i += 1) {
+      if (state.stopRequested) {
+        setStatus("Stopped.");
+        return;
+      }
+      const dest = destinationList[i];
+      setStatus(`Finding Hilton hotels near ${dest} (${i + 1}/${destinationList.length})…`);
+      const resolved = await resolveAirportHotels(dest);
+      if (resolved.cancelled || state.stopRequested) {
+        setStatus("Stopped.");
+        return;
+      }
+      hotelLists.push(resolved.hotels);
+      setProgress(18 + Math.round(((i + 1) / Math.max(1, destinationList.length)) * 22));
+    }
+
+    const hotels = mergeHotelsByCode(hotelLists);
+    if (!hotels.length) {
+      setProgress(100);
+      setStatus(`Award flights found, but no Hilton hotels near ${destinationList.join(", ")}.`);
+      applyBestTripCombo(null, { roundTrip });
+      return;
+    }
+
+    state.scanHotels = hotels;
+    setStatus(
+      `Found ${formatCount(hotels.length)} hotel${hotels.length === 1 ? "" : "s"} near ${destinationList.join(
+        ", "
+      )}. Scanning ${formatCount(uniqueRanges.length)} stay${uniqueRanges.length === 1 ? "" : "s"}…`
+    );
+    setProgress(42);
+
+    const scanRes = await sendMessage({
+      type: "SCAN_RATES",
+      hotels,
+      ranges: uniqueRanges,
+      friendsAndFamily: values.rateType !== "tm",
+      goOnly: values.goOnly,
+      maxRate: values.maxRate,
+      minRooms: values.minRooms,
+      delayMs: SCAN_DELAY_MS,
+    });
+
+    if (!scanRes.ok) {
+      if (scanRes.unauthorized || scanErrorsAreUnauthorized(scanRes.rows)) {
+        renderRows(scanRes.rows || []);
+        markUnauthorized(scanRes.error || "Hilton session expired. Sign in again to continue.");
+        return;
+      }
+      throw new Error(scanRes.error || "Rate scan failed");
+    }
+
+    state.scanHotels = [];
+    renderRows(scanRes.rows || []);
+    if (scanRes.unauthorized || scanErrorsAreUnauthorized(state.scanErrors)) {
+      markUnauthorized(scanRes.error || "Hilton session expired. Sign in again to continue.");
+      return;
+    }
+
+    setSession(scanRes.guestId || null, { userName: scanRes.userName || state.userName || null });
+    const matchedRows = (scanRes.rows || []).filter((r) => !r.error);
+    const matched = matchedRows.length;
+    const matchedHotels = uniqueHotelCount(matchedRows);
+    const failCount = state.scanErrors.length;
+    setProgress(100);
+    setStatus(
+      matched
+        ? `Done. ${formatCount(outboundUnique.length)} outbound${
+            roundTrip ? ` · ${formatCount(returnUnique.length)} return` : ""
+          } → ${formatCount(matched)} hotel rate${matched === 1 ? "" : "s"} across ${formatCount(
+            matchedHotels
+          )} hotel${matchedHotels === 1 ? "" : "s"} · ${formatCount(uniqueRanges.length)} stay${
+            uniqueRanges.length === 1 ? "" : "s"
+          }${failCount ? ` · ${formatCount(failCount)} failed` : ""}.`
+        : `Award flights found, but no matching hotel rates near ${destinationList.join(", ")}${
+            failCount ? ` · ${formatCount(failCount)} failed` : ""
+          }.`
+    );
+    resolveAndHighlightBestTripCombo({ roundTrip });
+    setHotelResultsVisible(true);
+  } catch (err) {
+    console.error(err);
+    setStatus(String(err?.message || err), "bad");
+  } finally {
+    setScanningUi(false);
+  }
+}
+
+async function setupSeatsApiKey() {
+  const input = $("seatsApiKey");
+  const saveBtn = $("saveSeatsKeyBtn");
+  if (!input || !saveBtn) return;
+  const SEATS_KEY_STORAGE = "seatsAeroApiKey";
+  try {
+    const data = await chrome.storage.local.get(SEATS_KEY_STORAGE);
+    if (data[SEATS_KEY_STORAGE]) input.value = String(data[SEATS_KEY_STORAGE]);
+  } catch {
+    /* ignore */
+  }
+  saveBtn.addEventListener("click", async () => {
+    const value = String(input.value || "").trim();
+    try {
+      await chrome.storage.local.set({ [SEATS_KEY_STORAGE]: value });
+      input.value = value;
+      setStatus(value ? "Seats.aero API key saved." : "Seats.aero API key cleared.", "ok");
+    } catch (err) {
+      setStatus(String(err?.message || err || "Could not save Seats.aero API key."), "bad");
+    }
+  });
 }
 
 function stopSearch() {
@@ -2952,6 +5022,11 @@ async function runSearch(event) {
   }
 
   const values = formValues();
+  if (values.searchMode === "flight") {
+    await runFlightHotelSearch(values);
+    return;
+  }
+
   const cachedSearch =
     isCachedSuggestion(state.selectedSuggestion) || /^cached$/i.test(values.destination);
   if (!values.destination) {
@@ -2972,6 +5047,7 @@ async function runSearch(event) {
     return;
   }
 
+  clearFlightResultsUi();
   writeParams(values);
   rememberCurrentSearch();
   state.stopRequested = false;
@@ -3266,7 +5342,17 @@ chrome.runtime?.onMessage?.addListener((message) => {
   const foundBit = hotelTotal
     ? `Found ${formatCount(hotelTotal)} hotel${hotelTotal === 1 ? "" : "s"} · `
     : "";
-  setStatus(`${foundBit}Scanning ${message.hotel || "…"}… · ${pct}%`);
+  const matchCount = Number(message.matches);
+  const failCount = Array.isArray(message.rows)
+    ? message.rows.filter((r) => r?.error).length
+    : 0;
+  const tallyBit =
+    Number.isFinite(matchCount) && matchCount >= 0
+      ? ` · ${formatCount(matchCount)} stay${matchCount === 1 ? "" : "s"}${
+          failCount ? ` · ${formatCount(failCount)} failed` : ""
+        }`
+      : "";
+  setStatus(`${foundBit}Scanning ${message.hotel || "…"}… · ${pct}%${tallyBit}`);
   if (Array.isArray(message.rows)) {
     renderRows(rowsForScanProgress(message.rows));
   }
@@ -3278,6 +5364,17 @@ function setupClearableDateFields() {
       writeParams(formValues());
     },
   });
+  setupDateRangesField("flightDateRanges", {
+    placeholder: "Add departure → return",
+    allowWindow: false,
+    ariaLabel: "Choose trip dates",
+    exactStartHint: "Select departure",
+    exactEndHint: "Select return",
+    onChange() {
+      writeParams(formValues());
+      updateSeatsApiCostHint();
+    },
+  });
 }
 
 async function boot() {
@@ -3285,6 +5382,23 @@ async function boot() {
   const start = todayISO();
   const end = addDaysISO(start, 1);
   setupClearableDateFields();
+  setupSearchMode();
+  setupFlightResultsUi();
+  setupFlightRecentSearches();
+  setTripSelectionListener(onTripFlightSelectionChange);
+  $("selectPriceOptimalFlightBtn")?.addEventListener("click", () => {
+    selectPriceOptimalTripCombo();
+  });
+  $("selectPriceOptimalHotelBtn")?.addEventListener("click", () => {
+    selectPriceOptimalTripCombo();
+  });
+  updatePriceOptimalSelectButtons();
+  $("tripSummaryClear")?.addEventListener("click", () => {
+    clearTripSelection();
+  });
+  $("tripSummarySave")?.addEventListener("click", () => {
+    toggleSaveCurrentItinerary();
+  });
   $("destination").value = "";
   state.selectedSuggestion = null;
   const initialRanges = params.ranges?.length
@@ -3299,8 +5413,19 @@ async function boot() {
   state.focusCtyhocn = params.ctyhocn || null;
   state.focusHotelName = params.hotel || null;
 
+  if ($("flightOrigins")) setIataCodes("flightOrigins", params.flightOrigins || "");
+  if ($("flightDestinations")) setIataCodes("flightDestinations", params.flightDestinations || "");
+  const initialFlightRanges =
+    params.flightRanges?.length
+      ? params.flightRanges
+      : [{ from: start, to: end, mode: "exact" }];
+  setDateRanges(initialFlightRanges, "flightDateRanges");
+  setFlightTripType(params.flightTripType === "oneway" ? "oneway" : "roundtrip");
+  setSearchMode(params.searchMode || "hotel");
+
   // Deep-link from map: open Cached search for one hotel (all dates / lengths).
   if (params.ctyhocn) {
+    setSearchMode("hotel");
     $("destination").value = "Cached";
     state.selectedSuggestion = { ...CACHED_SUGGESTION };
     setDateRanges([]);
@@ -3310,9 +5435,16 @@ async function boot() {
 
   await loadPersistedRoomDetails();
   await loadRecentSearches();
+  state.savedItineraries = await loadSavedItineraries();
+  await setupSeatsApiKey();
 
   $("searchForm").addEventListener("submit", runSearch);
   $("searchBtn").addEventListener("click", (e) => {
+    if (!state.scanning) return;
+    e.preventDefault();
+    stopSearch();
+  });
+  $("flightSearchBtn")?.addEventListener("click", (e) => {
     if (!state.scanning) return;
     e.preventDefault();
     stopSearch();
@@ -3389,6 +5521,13 @@ async function boot() {
       return;
     }
     if (e.target.closest("a")) return;
+    const hotelSelect = e.target.closest("[data-hotel-select]");
+    if (hotelSelect?.dataset.hotelSelect) {
+      e.preventDefault();
+      e.stopPropagation();
+      selectHotelForTrip(hotelSelect.dataset.hotelSelect);
+      return;
+    }
     const row = e.target.closest("tr.result-row");
     if (!row?.dataset.rowKey) return;
     toggleExpanded(row.dataset.rowKey);
@@ -3417,6 +5556,7 @@ async function boot() {
   setupRateTypeFilter();
   setupColumnFilters();
   setupDestinationAutocomplete();
+  setupIataAutocomplete();
   setupReauthHandling();
   setupMetricsSession();
   refreshSession();

@@ -883,6 +883,37 @@ async function hiltonMainWorldFetch(url, { method = "GET", headers = {}, body = 
   return result;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function backoffMs(attempt) {
+  const base = 1500 * 2 ** Math.max(0, attempt);
+  return Math.min(6000, base + Math.floor(Math.random() * 400));
+}
+
+/** After repeated 429/Akamai blocks, skip long retries so the scan can finish. */
+let hiltonPressureUntil = 0;
+
+function noteHiltonPressure() {
+  hiltonPressureUntil = Date.now() + 20000;
+}
+
+function underHiltonPressure() {
+  return Date.now() < hiltonPressureUntil;
+}
+
+function clearHiltonPressure() {
+  hiltonPressureUntil = 0;
+}
+
+function isRateLimited(result) {
+  if (!result) return false;
+  if (result.status === 429) return true;
+  const t = String(result.text || "");
+  return /too many requests|rate.?limit/i.test(t);
+}
+
 function isAkamaiForbidden(result) {
   if (!result) return true;
   const t = result.text || "";
@@ -902,16 +933,57 @@ function isAkamaiForbidden(result) {
   return /forbidden/i.test(t) && !/"errors"\s*:/.test(t);
 }
 
+function isTransientHiltonError(err) {
+  const msg = String(err?.message || err || "");
+  return /rate-?limit|too many requests|non-JSON \(429\)|returned 403|blocked the request|access denied|\bforbidden\b/i.test(
+    msg
+  );
+}
+
 async function hiltonPageFetch(url, { method = "GET", headers = {}, body = null } = {}) {
-  // 1) MAIN-world page fetch (correct browser Origin)
-  let result = await hiltonMainWorldFetch(url, { method, headers, body });
-  if (!isAkamaiForbidden(result)) return result;
+  // Keep retries short. Nested long backoffs made scans look stalled (minutes per hotel).
+  // Under sustained 429/Akamai pressure, fail fast so remaining jobs can finish.
+  const maxAttempts = underHiltonPressure() ? 1 : 2;
+  let last = null;
+  let triedSw = false;
 
-  // 2) SW fetch with DNR Origin rewrite + Bearer token
-  result = await hiltonSwFetch(url, { method, headers, body });
-  if (!isAkamaiForbidden(result)) return result;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const result = await hiltonMainWorldFetch(url, { method, headers, body });
+    last = result;
 
-  return result;
+    if (isRateLimited(result)) {
+      noteHiltonPressure();
+      if (attempt < maxAttempts - 1) {
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      return result;
+    }
+
+    if (!isAkamaiForbidden(result)) {
+      clearHiltonPressure();
+      return result;
+    }
+
+    // SW fallback once only — under rate pressure it almost always 403s and doubles load.
+    if (!triedSw && !underHiltonPressure()) {
+      triedSw = true;
+      const swResult = await hiltonSwFetch(url, { method, headers, body });
+      last = swResult;
+      if (!isAkamaiForbidden(swResult) && !isRateLimited(swResult)) {
+        clearHiltonPressure();
+        return swResult;
+      }
+      if (isRateLimited(swResult) || isAkamaiForbidden(swResult)) noteHiltonPressure();
+    } else {
+      noteHiltonPressure();
+    }
+
+    if (attempt < maxAttempts - 1) {
+      await sleep(backoffMs(attempt));
+    }
+  }
+  return last;
 }
 
 function isUnauthorizedGraphql(json, status) {
@@ -1121,6 +1193,11 @@ async function hiltonGraphql(
     if (status === 401 || textLooksUnauthorized(text)) {
       throw new UnauthorizedError("Hilton session expired. Sign in again to continue.");
     }
+    if (status === 429 || /too many requests|rate.?limit/i.test(text)) {
+      throw new Error(
+        "Hilton rate-limited the request (429). Wait a moment and retry, or increase scan delay."
+      );
+    }
     if (status === 403 || /access denied|forbidden/i.test(text)) {
       throw new Error(
         "Hilton returned 403. Open https://www.hilton.com/en/go-hilton/ signed-in in this Chrome profile, reload the extension, then retry."
@@ -1141,11 +1218,22 @@ async function hiltonGraphql(
     if (isInvalidOperationNameError(message)) {
       throw new Error(`Invalid operation name (${appName} / ${version})`);
     }
+    if (/^forbidden$/i.test(message.trim()) || /access denied|too many requests|rate.?limit/i.test(message)) {
+      throw new Error(
+        status === 429
+          ? "Hilton rate-limited the request (429). Wait a moment and retry, or increase scan delay."
+          : "Hilton returned 403. Open https://www.hilton.com/en/go-hilton/ signed-in in this Chrome profile, reload the extension, then retry."
+      );
+    }
     // Hilton returns field-level errors (nullable leadRate, partial regions) alongside
     // usable data — only fail when nothing came back.
     if (!hasGraphqlData(json.data)) {
       throw new Error(message);
     }
+  } else if (status === 429) {
+    throw new Error(
+      "Hilton rate-limited the request (429). Wait a moment and retry, or increase scan delay."
+    );
   } else if (status === 403) {
     throw new Error(
       "Hilton returned 403. Open https://www.hilton.com/en/go-hilton/ signed-in in this Chrome profile, reload the extension, then retry."
@@ -2779,6 +2867,10 @@ async function fetchShopRooms({
     } catch (err) {
       lastError = err;
       if (isUnauthorizedError(err)) throw err;
+      // Rate limits already retried in hiltonPageFetch — don't amplify with more clients.
+      if (/rate-?limit|too many requests|non-JSON \(429\)/i.test(String(err?.message || ""))) {
+        throw err;
+      }
       if (isInvalidOperationNameError(err)) continue;
       if (/403|blocked|forbidden/i.test(String(err?.message || ""))) continue;
       // Schema mismatch on this client — try next version.
@@ -3002,4 +3094,5 @@ export {
   getAuthSession,
   getAccessTokenFingerprint,
   isUnauthorizedError,
+  isTransientHiltonError,
 };

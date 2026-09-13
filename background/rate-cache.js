@@ -1,13 +1,15 @@
 /**
- * Persistent calendar-rate cache (IndexedDB).
+ * Persistent rate cache (IndexedDB) — hotel calendars + shop rooms only for the map.
+ * Seats.aero flight searches use a separate store and are never shown on the map.
  * Entries older than TTL_MS are treated as stale and refreshed on next use.
  */
 
 const DB_NAME = "go-rates-cache";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE = "calendars";
 const ROOM_STORE = "shopRooms";
-const TTL_MS = 24 * 60 * 60 * 1000;
+const FLIGHT_STORE = "seatsFlights";
+const TTL_MS = 4 * 60 * 60 * 1000;
 
 function openDb() {
   return new Promise((resolve, reject) => {
@@ -21,6 +23,10 @@ function openDb() {
       }
       if (!db.objectStoreNames.contains(ROOM_STORE)) {
         const store = db.createObjectStore(ROOM_STORE, { keyPath: "key" });
+        store.createIndex("fetchedAt", "fetchedAt", { unique: false });
+      }
+      if (!db.objectStoreNames.contains(FLIGHT_STORE)) {
+        const store = db.createObjectStore(FLIGHT_STORE, { keyPath: "key" });
         store.createIndex("fetchedAt", "fetchedAt", { unique: false });
       }
     };
@@ -201,7 +207,9 @@ async function pruneStaleCache() {
   const db = await openDb();
   try {
     await new Promise((resolve, reject) => {
-      const tx = db.transaction([STORE, ROOM_STORE], "readwrite");
+      const stores = [STORE, ROOM_STORE];
+      if (db.objectStoreNames.contains(FLIGHT_STORE)) stores.push(FLIGHT_STORE);
+      const tx = db.transaction(stores, "readwrite");
 
       const calendars = tx.objectStore(STORE);
       const calReq = calendars.openCursor();
@@ -223,6 +231,18 @@ async function pruneStaleCache() {
         cursor.delete();
         cursor.continue();
       };
+
+      if (db.objectStoreNames.contains(FLIGHT_STORE)) {
+        const flights = tx.objectStore(FLIGHT_STORE);
+        const flightIndex = flights.index("fetchedAt");
+        const flightReq = flightIndex.openCursor(IDBKeyRange.upperBound(cutoff));
+        flightReq.onsuccess = () => {
+          const cursor = flightReq.result;
+          if (!cursor) return;
+          cursor.delete();
+          cursor.continue();
+        };
+      }
 
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
@@ -362,8 +382,120 @@ async function deleteCachedShopRooms(params) {
   }
 }
 
+function normalizeAirportKeyPart(value) {
+  const raw = Array.isArray(value) ? value.join(",") : String(value || "");
+  return [
+    ...new Set(
+      raw
+        .toUpperCase()
+        .split(/[\s,;]+/)
+        .map((s) => s.trim())
+        .filter((s) => /^[A-Z]{3}$/.test(s))
+    ),
+  ]
+    .sort()
+    .join(",");
+}
+
+/** Flight award cache — separate from hotel calendars (never used by the map). */
+function flightSearchCacheKey({
+  originAirports,
+  destinationAirports,
+  startDate,
+  endDate,
+  transferPartners = "chase",
+  onlyDirect = false,
+  cabins = null,
+  includeTrips = true,
+}) {
+  return [
+    "seats",
+    normalizeAirportKeyPart(originAirports),
+    normalizeAirportKeyPart(destinationAirports),
+    startDate || "",
+    endDate || "",
+    String(transferPartners || "chase").toLowerCase(),
+    onlyDirect ? "direct" : "any",
+    cabins ? String(cabins) : "",
+    // "trips-full" busts older minify_trips caches that lacked aircraft/segments.
+    includeTrips ? "trips-full" : "summary",
+  ].join("|");
+}
+
+async function getCachedFlightSearch(params) {
+  const key = flightSearchCacheKey(params);
+  const db = await openDb();
+  try {
+    if (!db.objectStoreNames.contains(FLIGHT_STORE)) return null;
+    const entry = await new Promise((resolve, reject) => {
+      const tx = db.transaction(FLIGHT_STORE, "readonly");
+      const req = tx.objectStore(FLIGHT_STORE).get(key);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+    if (!entry?.payload) return null;
+    const age = Date.now() - Number(entry.fetchedAt || 0);
+    if (age > TTL_MS) return null;
+    return {
+      ...entry.payload,
+      fromCache: true,
+      fetchedAt: entry.fetchedAt,
+      ageMs: age,
+    };
+  } finally {
+    db.close();
+  }
+}
+
+async function setCachedFlightSearch(params, payload) {
+  const key = flightSearchCacheKey(params);
+  const db = await openDb();
+  try {
+    if (!db.objectStoreNames.contains(FLIGHT_STORE)) return;
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(FLIGHT_STORE, "readwrite");
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.objectStore(FLIGHT_STORE).put({
+        key,
+        fetchedAt: Date.now(),
+        payload: {
+          flights: payload.flights || [],
+          count: payload.count ?? (payload.flights || []).length,
+          rawCount: payload.rawCount ?? null,
+          origins: payload.origins || [],
+          destinations: payload.destinations || [],
+          startDate: payload.startDate || null,
+          endDate: payload.endDate || null,
+          transferPartners: payload.transferPartners || "chase",
+          sources: payload.sources ?? null,
+        },
+      });
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function deleteCachedFlightSearch(params) {
+  const key = flightSearchCacheKey(params);
+  const db = await openDb();
+  try {
+    if (!db.objectStoreNames.contains(FLIGHT_STORE)) return;
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(FLIGHT_STORE, "readwrite");
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.objectStore(FLIGHT_STORE).delete(key);
+    });
+  } finally {
+    db.close();
+  }
+}
+
 /**
  * Unique hotels from the calendar cache for the coverage map.
+ * Hotel rates only — never includes Seats.aero flight cache.
  * Aggregates entry counts; prefers stored lat/lon.
  */
 async function listCachedMapHotels({ includeStale = true } = {}) {
@@ -440,5 +572,8 @@ export {
   getCachedShopRooms,
   setCachedShopRooms,
   deleteCachedShopRooms,
+  getCachedFlightSearch,
+  setCachedFlightSearch,
+  deleteCachedFlightSearch,
   pruneStaleCache,
 };
